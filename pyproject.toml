@@ -5,10 +5,14 @@ description = ""
 authors = [
     {name = "Martin",email = "25009432+tinybeachthor@users.noreply.github.com"}
 ]
-readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
+    "pyfuse3>=3.3.0",
+    "trio>=0.22.0",
 ]
+
+[project.scripts]
+nofs = "nofs.__main__:main"
 
 
 [build-system]
