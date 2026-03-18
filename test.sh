@@ -20,7 +20,8 @@ mkdir "$SOURCE/subdir"
 echo "nested" > "$SOURCE/subdir/nested.txt"
 
 # Mount
-poetry run nofs "$SOURCE" "$MOUNT" &
+cargo build --release 2>&1
+./target/release/nofs "$SOURCE" "$MOUNT" &
 NOFS_PID=$!
 
 # Wait for mount to be ready

@@ -1,0 +1,15 @@
+[package]
+name = "nofs"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "nofs"
+path = "src/main.rs"
+
+[dependencies]
+fuser = "0.15"
+clap = { version = "4", features = ["derive"] }
+log = "0.4"
+env_logger = "0.11"
+libc = "0.2"
