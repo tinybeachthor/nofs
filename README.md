@@ -1,19 +1,19 @@
 # nofs
 
-A passthrough FUSE filesystem built with [pyfuse3](https://github.com/libfuse/pyfuse3) and [trio](https://trio.readthedocs.io/).
+A passthrough FUSE filesystem in Rust with a GUI window.
 
-Mirrors a source directory to a mountpoint, passing all file operations through to the underlying filesystem.
+Mirrors a source directory to a mountpoint, passing all file operations through to the underlying filesystem. Shows an [eframe/egui](https://github.com/emilk/egui) window while mounted.
 
 ## Requirements
 
-- Python >= 3.13
+- Rust (via [Nix flake](flake.nix) or manually)
 - FUSE 3 (`libfuse3-dev` on Debian/Ubuntu)
-- [Poetry](https://python-poetry.org/)
 
-## Installation
+## Building
 
 ```sh
-poetry install
+nix develop  # sets up Rust toolchain and system deps
+cargo build --release
 ```
 
 ## Usage
@@ -22,11 +22,14 @@ poetry install
 nofs <source> <mountpoint>
 ```
 
+A GUI window will appear while the filesystem is mounted. Closing the window unmounts the filesystem.
+
 ### Options
 
 | Flag             | Description                              |
 |------------------|------------------------------------------|
 | `--allow-other`  | Allow other users to access the mount    |
+| `--no-ui`        | Disable the GUI window                   |
 | `--debug`        | Enable debug logging                     |
 | `--debug-fuse`   | Enable FUSE debug output                 |
 
@@ -41,7 +44,7 @@ nofs /home/user/documents /tmp/mount
 To unmount:
 
 ```sh
-fusermount -u /tmp/mount
+fusermount3 -u /tmp/mount
 ```
 
 ## Testing
