@@ -1,133 +1,50 @@
 use fuser::{
-    FileAttr, FileType, Filesystem, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty,
-    ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite, Request, TimeOrNow,
+    FileAttr, FileType, Filesystem, KernelConfig, ReplyAttr, ReplyCreate, ReplyData,
+    ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite, Request, TimeOrNow,
 };
-use libc::{self, c_int};
+use libc;
+use polars::prelude::*;
+use polars::io::avro::{AvroReader, AvroWriter};
+use sha2::{Digest, Sha256};
 
 use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-const TTL: Duration = Duration::from_secs(0);
+const TTL: Duration = Duration::from_secs(1);
 const FUSE_ROOT_INODE: u64 = 1;
+const FLUSH_INTERVAL: Duration = Duration::from_secs(30);
 
-#[derive(Debug, Clone)]
-enum InodePaths {
-    Single(PathBuf),
-    Multi(Vec<PathBuf>),
+fn now_timespec() -> (i64, u32) {
+    let d = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    (d.as_secs() as i64, d.subsec_nanos())
 }
 
-pub struct PassthroughFS {
-    inode_path_map: HashMap<u64, InodePaths>,
-    lookup_cnt: HashMap<u64, u64>,
-    fd_inode_map: HashMap<i32, u64>,
-    inode_fd_map: HashMap<u64, i32>,
-    fd_open_count: HashMap<i32, u64>,
-}
-
-impl PassthroughFS {
-    pub fn new(source: PathBuf) -> Self {
-        let mut inode_path_map = HashMap::new();
-        inode_path_map.insert(FUSE_ROOT_INODE, InodePaths::Single(source));
-        PassthroughFS {
-            inode_path_map,
-            lookup_cnt: HashMap::new(),
-            fd_inode_map: HashMap::new(),
-            inode_fd_map: HashMap::new(),
-            fd_open_count: HashMap::new(),
-        }
-    }
-
-    fn inode_to_path(&self, inode: u64) -> Result<PathBuf, c_int> {
-        match self.inode_path_map.get(&inode) {
-            Some(InodePaths::Single(p)) => Ok(p.clone()),
-            Some(InodePaths::Multi(set)) => Ok(set.iter().next().unwrap().clone()),
-            None => Err(libc::ENOENT),
-        }
-    }
-
-    fn add_path(&mut self, inode: u64, path: PathBuf) {
-        *self.lookup_cnt.entry(inode).or_insert(0) += 1;
-        match self.inode_path_map.get_mut(&inode) {
-            None => {
-                self.inode_path_map
-                    .insert(inode, InodePaths::Single(path));
-            }
-            Some(entry) => match entry {
-                InodePaths::Multi(set) => {
-                    if !set.contains(&path) {
-                        set.push(path);
-                    }
-                }
-                InodePaths::Single(existing) => {
-                    if *existing != path {
-                        let old = existing.clone();
-                        *entry = InodePaths::Multi(vec![old, path]);
-                    }
-                }
-            },
-        }
-    }
-
-    fn forget_path(&mut self, inode: u64, path: &Path) {
-        match self.inode_path_map.get_mut(&inode) {
-            Some(InodePaths::Multi(set)) => {
-                set.retain(|p| p != path);
-                if set.len() == 1 {
-                    let remaining = set[0].clone();
-                    self.inode_path_map
-                        .insert(inode, InodePaths::Single(remaining));
-                }
-            }
-            Some(InodePaths::Single(_)) => {
-                self.inode_path_map.remove(&inode);
-            }
-            None => {}
-        }
-    }
-
-    fn get_attr_path(&self, path: &Path) -> Result<FileAttr, c_int> {
-        let meta = std::fs::symlink_metadata(path).map_err(|e| e.raw_os_error().unwrap_or(libc::EIO))?;
-        Ok(metadata_to_file_attr(&meta))
-    }
-
-    fn get_attr_fd(&self, fd: i32) -> Result<FileAttr, c_int> {
-        let meta = fd_metadata(fd)?;
-        Ok(metadata_to_file_attr(&meta))
-    }
-
-    fn get_attr(&self, inode: u64) -> Result<FileAttr, c_int> {
-        if let Some(&fd) = self.inode_fd_map.get(&inode) {
-            self.get_attr_fd(fd)
-        } else {
-            let path = self.inode_to_path(inode)?;
-            self.get_attr_path(&path)
-        }
+fn file_type_to_u8(ft: FileType) -> u8 {
+    match ft {
+        FileType::RegularFile => 0,
+        FileType::Directory => 1,
+        FileType::Symlink => 2,
+        FileType::BlockDevice => 3,
+        FileType::CharDevice => 4,
+        FileType::NamedPipe => 5,
+        FileType::Socket => 6,
     }
 }
 
-fn metadata_to_file_attr(meta: &std::fs::Metadata) -> FileAttr {
-    let kind = mode_to_file_type(meta.mode());
-    let blksize = 512u64;
-    FileAttr {
-        ino: meta.ino(),
-        size: meta.size(),
-        blocks: (meta.size() + blksize - 1) / blksize,
-        atime: UNIX_EPOCH + Duration::from_nanos(meta.atime() as u64 * 1_000_000_000 + meta.atime_nsec() as u64),
-        mtime: UNIX_EPOCH + Duration::from_nanos(meta.mtime() as u64 * 1_000_000_000 + meta.mtime_nsec() as u64),
-        ctime: UNIX_EPOCH + Duration::from_nanos(meta.ctime() as u64 * 1_000_000_000 + meta.ctime_nsec() as u64),
-        crtime: UNIX_EPOCH,
-        kind,
-        perm: (meta.mode() & 0o7777) as u16,
-        nlink: meta.nlink() as u32,
-        uid: meta.uid(),
-        gid: meta.gid(),
-        rdev: meta.rdev() as u32,
-        blksize: blksize as u32,
-        flags: 0,
+fn u8_to_file_type(v: u8) -> FileType {
+    match v {
+        1 => FileType::Directory,
+        2 => FileType::Symlink,
+        3 => FileType::BlockDevice,
+        4 => FileType::CharDevice,
+        5 => FileType::NamedPipe,
+        6 => FileType::Socket,
+        _ => FileType::RegularFile,
     }
 }
 
@@ -144,58 +61,448 @@ fn mode_to_file_type(mode: u32) -> FileType {
     }
 }
 
-fn fd_metadata(fd: i32) -> Result<std::fs::Metadata, c_int> {
-    use std::os::unix::io::FromRawFd;
-    // We use File::from_raw_fd to get metadata, then forget the file so we don't close the fd
-    let file = unsafe { std::fs::File::from_raw_fd(fd) };
-    let meta = file.metadata().map_err(|e| e.raw_os_error().unwrap_or(libc::EIO));
-    std::mem::forget(file);
-    meta
+#[derive(Clone, Debug)]
+struct InodeMeta {
+    inode: u64,
+    file_type: FileType,
+    permissions: u16,
+    uid: u32,
+    gid: u32,
+    size: u64,
+    nlink: u32,
+    atime_secs: i64,
+    atime_nsecs: u32,
+    mtime_secs: i64,
+    mtime_nsecs: u32,
+    ctime_secs: i64,
+    ctime_nsecs: u32,
+    blob_hash: Option<String>,
+    symlink_target: Option<String>,
+    rdev: u32,
 }
 
-fn time_or_now_to_timespec(t: TimeOrNow) -> libc::timespec {
-    match t {
-        TimeOrNow::SpecificTime(st) => {
-            let d = st.duration_since(UNIX_EPOCH).unwrap_or_default();
-            libc::timespec {
-                tv_sec: d.as_secs() as i64,
-                tv_nsec: d.subsec_nanos() as i64,
-            }
-        }
-        TimeOrNow::Now => {
-            let d = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
-            libc::timespec {
-                tv_sec: d.as_secs() as i64,
-                tv_nsec: d.subsec_nanos() as i64,
-            }
+impl InodeMeta {
+    fn to_file_attr(&self) -> FileAttr {
+        let blksize = 512u64;
+        FileAttr {
+            ino: self.inode,
+            size: self.size,
+            blocks: (self.size + blksize - 1) / blksize,
+            atime: UNIX_EPOCH + Duration::new(self.atime_secs as u64, self.atime_nsecs),
+            mtime: UNIX_EPOCH + Duration::new(self.mtime_secs as u64, self.mtime_nsecs),
+            ctime: UNIX_EPOCH + Duration::new(self.ctime_secs as u64, self.ctime_nsecs),
+            crtime: UNIX_EPOCH,
+            kind: self.file_type,
+            perm: self.permissions,
+            nlink: self.nlink,
+            uid: self.uid,
+            gid: self.gid,
+            rdev: self.rdev,
+            blksize: blksize as u32,
+            flags: 0,
         }
     }
 }
 
-fn system_time_to_timespec(st: SystemTime) -> libc::timespec {
-    let d = st.duration_since(UNIX_EPOCH).unwrap_or_default();
-    libc::timespec {
-        tv_sec: d.as_secs() as i64,
-        tv_nsec: d.subsec_nanos() as i64,
+struct OpenFile {
+    inode: u64,
+    data: Vec<u8>,
+    writable: bool,
+    dirty: bool,
+}
+
+pub struct NofsFS {
+    data_dir: PathBuf,
+    blob_dir: PathBuf,
+    metadata_path: PathBuf,
+
+    inode_meta: HashMap<u64, InodeMeta>,
+    dir_entries: HashMap<(u64, String), u64>,
+
+    next_inode: u64,
+    next_fh: u64,
+    open_files: HashMap<u64, OpenFile>,
+    lookup_cnt: HashMap<u64, u64>,
+    dirty: bool,
+    last_flush: Instant,
+}
+
+impl NofsFS {
+    pub fn new(data_dir: PathBuf) -> Self {
+        let blob_dir = data_dir.join("blobs");
+        let metadata_path = data_dir.join("metadata.avro");
+        NofsFS {
+            data_dir,
+            blob_dir,
+            metadata_path,
+            inode_meta: HashMap::new(),
+            dir_entries: HashMap::new(),
+            next_inode: 2,
+            next_fh: 1,
+            open_files: HashMap::new(),
+            lookup_cnt: HashMap::new(),
+            dirty: false,
+            last_flush: Instant::now(),
+        }
+    }
+
+    fn alloc_inode(&mut self) -> u64 {
+        let ino = self.next_inode;
+        self.next_inode += 1;
+        ino
+    }
+
+    fn alloc_fh(&mut self) -> u64 {
+        let fh = self.next_fh;
+        self.next_fh += 1;
+        fh
+    }
+
+    fn parent_of(&self, ino: u64) -> u64 {
+        if ino == FUSE_ROOT_INODE {
+            return FUSE_ROOT_INODE;
+        }
+        for ((parent, _), &child) in &self.dir_entries {
+            if child == ino {
+                return *parent;
+            }
+        }
+        FUSE_ROOT_INODE
+    }
+
+    fn mark_dirty(&mut self) {
+        self.dirty = true;
+        self.maybe_flush();
+    }
+
+    fn maybe_flush(&mut self) {
+        if self.dirty && self.last_flush.elapsed() >= FLUSH_INTERVAL {
+            self.flush_metadata();
+            self.dirty = false;
+            self.last_flush = Instant::now();
+        }
+    }
+
+    // --- Blob helpers ---
+
+    fn blob_path(&self, hash: &str) -> PathBuf {
+        self.blob_dir.join(&hash[..2]).join(&hash[2..])
+    }
+
+    fn read_blob(&self, hash: &str) -> Vec<u8> {
+        std::fs::read(self.blob_path(hash)).unwrap_or_default()
+    }
+
+    fn write_blob(&self, data: &[u8]) -> String {
+        let hash = hex::encode(Sha256::digest(data));
+        let path = self.blob_path(&hash);
+        if !path.exists() {
+            std::fs::create_dir_all(path.parent().unwrap()).ok();
+            let tmp = path.with_extension("tmp");
+            std::fs::write(&tmp, data).expect("Failed to write blob");
+            std::fs::rename(&tmp, &path).expect("Failed to rename blob");
+        }
+        hash
+    }
+
+    fn delete_blob_if_unreferenced(&self, hash: &str) {
+        let referenced = self
+            .inode_meta
+            .values()
+            .any(|m| m.blob_hash.as_deref() == Some(hash));
+        if !referenced {
+            std::fs::remove_file(self.blob_path(hash)).ok();
+        }
+    }
+
+    // --- Metadata serialization ---
+
+    fn load_metadata(&mut self) {
+        if !self.metadata_path.exists() {
+            let (secs, nsecs) = now_timespec();
+            self.inode_meta.insert(
+                FUSE_ROOT_INODE,
+                InodeMeta {
+                    inode: FUSE_ROOT_INODE,
+                    file_type: FileType::Directory,
+                    permissions: 0o755,
+                    uid: unsafe { libc::getuid() },
+                    gid: unsafe { libc::getgid() },
+                    size: 0,
+                    nlink: 2,
+                    atime_secs: secs,
+                    atime_nsecs: nsecs,
+                    mtime_secs: secs,
+                    mtime_nsecs: nsecs,
+                    ctime_secs: secs,
+                    ctime_nsecs: nsecs,
+                    blob_hash: None,
+                    symlink_target: None,
+                    rdev: 0,
+                },
+            );
+            self.next_inode = 2;
+            return;
+        }
+
+        let file = std::fs::File::open(&self.metadata_path).expect("Failed to open metadata");
+        let df = AvroReader::new(file)
+            .finish()
+            .expect("Failed to read AVRO");
+
+        let col_inode = df.column("inode").unwrap().i64().unwrap();
+        let col_parent = df.column("parent_inode").unwrap().i64().unwrap();
+        let col_name = df.column("name").unwrap().str().unwrap();
+        let col_ft = df.column("file_type").unwrap().i32().unwrap();
+        let col_perm = df.column("permissions").unwrap().i32().unwrap();
+        let col_uid = df.column("uid").unwrap().i32().unwrap();
+        let col_gid = df.column("gid").unwrap().i32().unwrap();
+        let col_size = df.column("size").unwrap().i64().unwrap();
+        let col_nlink = df.column("nlink").unwrap().i32().unwrap();
+        let col_atime_s = df.column("atime_secs").unwrap().i64().unwrap();
+        let col_atime_ns = df.column("atime_nsecs").unwrap().i32().unwrap();
+        let col_mtime_s = df.column("mtime_secs").unwrap().i64().unwrap();
+        let col_mtime_ns = df.column("mtime_nsecs").unwrap().i32().unwrap();
+        let col_ctime_s = df.column("ctime_secs").unwrap().i64().unwrap();
+        let col_ctime_ns = df.column("ctime_nsecs").unwrap().i32().unwrap();
+        let col_blob = df.column("blob_hash").unwrap().str().unwrap();
+        let col_symlink = df.column("symlink_target").unwrap().str().unwrap();
+        let col_rdev = df.column("rdev").unwrap().i32().unwrap();
+
+        let mut max_inode: u64 = 0;
+        for i in 0..df.height() {
+            let inode = col_inode.get(i).unwrap() as u64;
+            let parent_inode = col_parent.get(i).unwrap() as u64;
+            let name = col_name.get(i).unwrap();
+
+            if parent_inode > 0 && !name.is_empty() {
+                self.dir_entries
+                    .insert((parent_inode, name.to_string()), inode);
+            }
+
+            if !self.inode_meta.contains_key(&inode) {
+                self.inode_meta.insert(
+                    inode,
+                    InodeMeta {
+                        inode,
+                        file_type: u8_to_file_type(col_ft.get(i).unwrap() as u8),
+                        permissions: col_perm.get(i).unwrap() as u16,
+                        uid: col_uid.get(i).unwrap() as u32,
+                        gid: col_gid.get(i).unwrap() as u32,
+                        size: col_size.get(i).unwrap() as u64,
+                        nlink: col_nlink.get(i).unwrap() as u32,
+                        atime_secs: col_atime_s.get(i).unwrap(),
+                        atime_nsecs: col_atime_ns.get(i).unwrap() as u32,
+                        mtime_secs: col_mtime_s.get(i).unwrap(),
+                        mtime_nsecs: col_mtime_ns.get(i).unwrap() as u32,
+                        ctime_secs: col_ctime_s.get(i).unwrap(),
+                        ctime_nsecs: col_ctime_ns.get(i).unwrap() as u32,
+                        blob_hash: col_blob.get(i).map(|s: &str| s.to_string()),
+                        symlink_target: col_symlink.get(i).map(|s: &str| s.to_string()),
+                        rdev: col_rdev.get(i).unwrap() as u32,
+                    },
+                );
+            }
+
+            max_inode = max_inode.max(inode);
+        }
+
+        self.next_inode = max_inode + 1;
+    }
+
+    fn flush_metadata(&self) {
+        // Collect rows: root inode + all dir entries
+        struct Row {
+            inode: i64,
+            parent_inode: i64,
+            name: String,
+            file_type: i32,
+            permissions: i32,
+            uid: i32,
+            gid: i32,
+            size: i64,
+            nlink: i32,
+            atime_secs: i64,
+            atime_nsecs: i32,
+            mtime_secs: i64,
+            mtime_nsecs: i32,
+            ctime_secs: i64,
+            ctime_nsecs: i32,
+            blob_hash: Option<String>,
+            symlink_target: Option<String>,
+            rdev: i32,
+        }
+
+        fn meta_to_row(meta: &InodeMeta, parent: u64, name: String) -> Row {
+            Row {
+                inode: meta.inode as i64,
+                parent_inode: parent as i64,
+                name,
+                file_type: file_type_to_u8(meta.file_type) as i32,
+                permissions: meta.permissions as i32,
+                uid: meta.uid as i32,
+                gid: meta.gid as i32,
+                size: meta.size as i64,
+                nlink: meta.nlink as i32,
+                atime_secs: meta.atime_secs,
+                atime_nsecs: meta.atime_nsecs as i32,
+                mtime_secs: meta.mtime_secs,
+                mtime_nsecs: meta.mtime_nsecs as i32,
+                ctime_secs: meta.ctime_secs,
+                ctime_nsecs: meta.ctime_nsecs as i32,
+                blob_hash: meta.blob_hash.clone(),
+                symlink_target: meta.symlink_target.clone(),
+                rdev: meta.rdev as i32,
+            }
+        }
+
+        let mut rows: Vec<Row> = Vec::new();
+
+        // Root inode row (parent=0, name="")
+        if let Some(meta) = self.inode_meta.get(&FUSE_ROOT_INODE) {
+            rows.push(meta_to_row(meta, 0, String::new()));
+        }
+
+        // One row per dir entry
+        for ((parent, name), &child_inode) in &self.dir_entries {
+            if let Some(meta) = self.inode_meta.get(&child_inode) {
+                rows.push(meta_to_row(meta, *parent, name.clone()));
+            }
+        }
+
+        let v_inode: Vec<i64> = rows.iter().map(|r| r.inode).collect();
+        let v_parent: Vec<i64> = rows.iter().map(|r| r.parent_inode).collect();
+        let v_name: Vec<&str> = rows.iter().map(|r| r.name.as_str()).collect();
+        let v_ft: Vec<i32> = rows.iter().map(|r| r.file_type).collect();
+        let v_perm: Vec<i32> = rows.iter().map(|r| r.permissions).collect();
+        let v_uid: Vec<i32> = rows.iter().map(|r| r.uid).collect();
+        let v_gid: Vec<i32> = rows.iter().map(|r| r.gid).collect();
+        let v_size: Vec<i64> = rows.iter().map(|r| r.size).collect();
+        let v_nlink: Vec<i32> = rows.iter().map(|r| r.nlink).collect();
+        let v_atime_s: Vec<i64> = rows.iter().map(|r| r.atime_secs).collect();
+        let v_atime_ns: Vec<i32> = rows.iter().map(|r| r.atime_nsecs).collect();
+        let v_mtime_s: Vec<i64> = rows.iter().map(|r| r.mtime_secs).collect();
+        let v_mtime_ns: Vec<i32> = rows.iter().map(|r| r.mtime_nsecs).collect();
+        let v_ctime_s: Vec<i64> = rows.iter().map(|r| r.ctime_secs).collect();
+        let v_ctime_ns: Vec<i32> = rows.iter().map(|r| r.ctime_nsecs).collect();
+        let v_blob: Vec<Option<&str>> = rows.iter().map(|r| r.blob_hash.as_deref()).collect();
+        let v_symlink: Vec<Option<&str>> =
+            rows.iter().map(|r| r.symlink_target.as_deref()).collect();
+        let v_rdev: Vec<i32> = rows.iter().map(|r| r.rdev).collect();
+
+        let mut df = DataFrame::new(vec![
+            Series::new("inode".into(), &v_inode).into(),
+            Series::new("parent_inode".into(), &v_parent).into(),
+            Series::new("name".into(), &v_name).into(),
+            Series::new("file_type".into(), &v_ft).into(),
+            Series::new("permissions".into(), &v_perm).into(),
+            Series::new("uid".into(), &v_uid).into(),
+            Series::new("gid".into(), &v_gid).into(),
+            Series::new("size".into(), &v_size).into(),
+            Series::new("nlink".into(), &v_nlink).into(),
+            Series::new("atime_secs".into(), &v_atime_s).into(),
+            Series::new("atime_nsecs".into(), &v_atime_ns).into(),
+            Series::new("mtime_secs".into(), &v_mtime_s).into(),
+            Series::new("mtime_nsecs".into(), &v_mtime_ns).into(),
+            Series::new("ctime_secs".into(), &v_ctime_s).into(),
+            Series::new("ctime_nsecs".into(), &v_ctime_ns).into(),
+            Series::new("blob_hash".into(), &v_blob).into(),
+            Series::new("symlink_target".into(), &v_symlink).into(),
+            Series::new("rdev".into(), &v_rdev).into(),
+        ])
+        .expect("Failed to create DataFrame");
+
+        let tmp_path = self.metadata_path.with_extension("avro.tmp");
+        let mut file =
+            std::fs::File::create(&tmp_path).expect("Failed to create temp metadata file");
+        AvroWriter::new(&mut file)
+            .finish(&mut df)
+            .expect("Failed to write AVRO");
+        std::fs::rename(&tmp_path, &self.metadata_path).expect("Failed to rename metadata file");
+    }
+
+    // --- Open file helpers ---
+
+    fn flush_open_file(&mut self, fh: u64) {
+        let (inode, data) = {
+            let open_file = match self.open_files.get(&fh) {
+                Some(f) if f.dirty => f,
+                _ => return,
+            };
+            (open_file.inode, open_file.data.clone())
+        };
+
+        let old_hash = self
+            .inode_meta
+            .get(&inode)
+            .and_then(|m| m.blob_hash.clone());
+
+        let new_hash = if data.is_empty() {
+            None
+        } else {
+            Some(self.write_blob(&data))
+        };
+
+        if let Some(meta) = self.inode_meta.get_mut(&inode) {
+            meta.blob_hash = new_hash;
+            meta.size = data.len() as u64;
+            let (secs, nsecs) = now_timespec();
+            meta.mtime_secs = secs;
+            meta.mtime_nsecs = nsecs;
+            meta.ctime_secs = secs;
+            meta.ctime_nsecs = nsecs;
+        }
+
+        if let Some(of) = self.open_files.get_mut(&fh) {
+            of.dirty = false;
+        }
+
+        self.dirty = true;
+
+        if let Some(hash) = old_hash {
+            self.delete_blob_if_unreferenced(&hash);
+        }
     }
 }
 
-impl Filesystem for PassthroughFS {
+impl Filesystem for NofsFS {
+    fn init(
+        &mut self,
+        _req: &Request<'_>,
+        _config: &mut KernelConfig,
+    ) -> Result<(), libc::c_int> {
+        std::fs::create_dir_all(&self.blob_dir).map_err(|_| libc::EIO)?;
+        self.load_metadata();
+        Ok(())
+    }
+
+    fn destroy(&mut self) {
+        // Flush any open dirty files
+        let fhs: Vec<u64> = self.open_files.keys().cloned().collect();
+        for fh in fhs {
+            self.flush_open_file(fh);
+        }
+        self.flush_metadata();
+    }
+
     fn lookup(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEntry) {
-        let parent_path = match self.inode_to_path(parent) {
-            Ok(p) => p,
-            Err(e) => return reply.error(e),
+        let name_str = match name.to_str() {
+            Some(s) => s,
+            None => return reply.error(libc::ENOENT),
         };
-        let path = parent_path.join(name);
-        let attr = match self.get_attr_path(&path) {
-            Ok(a) => a,
-            Err(e) => return reply.error(e),
+
+        let child_ino = match self.dir_entries.get(&(parent, name_str.to_string())) {
+            Some(&ino) => ino,
+            None => return reply.error(libc::ENOENT),
         };
-        let name_bytes = name.as_bytes();
-        if name_bytes != b"." && name_bytes != b".." {
-            self.add_path(attr.ino, path);
-        }
-        reply.entry(&TTL, &attr, 0);
+
+        let meta = match self.inode_meta.get(&child_ino) {
+            Some(m) => m,
+            None => return reply.error(libc::ENOENT),
+        };
+
+        *self.lookup_cnt.entry(child_ino).or_insert(0) += 1;
+        reply.entry(&TTL, &meta.to_file_attr(), 0);
     }
 
     fn forget(&mut self, _req: &Request, ino: u64, nlookup: u64) {
@@ -206,14 +513,25 @@ impl Filesystem for PassthroughFS {
             }
         }
         self.lookup_cnt.remove(&ino);
-        self.inode_path_map.remove(&ino);
     }
 
     fn getattr(&mut self, _req: &Request, ino: u64, _fh: Option<u64>, reply: ReplyAttr) {
-        match self.get_attr(ino) {
-            Ok(attr) => reply.attr(&TTL, &attr),
-            Err(e) => reply.error(e),
+        let meta = match self.inode_meta.get(&ino) {
+            Some(m) => m,
+            None => return reply.error(libc::ENOENT),
+        };
+        let mut attr = meta.to_file_attr();
+
+        // If open for writing, use buffer size
+        for of in self.open_files.values() {
+            if of.inode == ino && of.writable {
+                attr.size = of.data.len() as u64;
+                attr.blocks = (attr.size + 511) / 512;
+                break;
+            }
         }
+
+        reply.attr(&TTL, &attr);
     }
 
     fn setattr(
@@ -234,95 +552,133 @@ impl Filesystem for PassthroughFS {
         _flags: Option<u32>,
         reply: ReplyAttr,
     ) {
-        let path = match self.inode_to_path(ino) {
-            Ok(p) => p,
-            Err(e) => return reply.error(e),
-        };
+        if !self.inode_meta.contains_key(&ino) {
+            return reply.error(libc::ENOENT);
+        }
+
+        let (secs, nsecs) = now_timespec();
 
         // Truncate
         if let Some(new_size) = size {
-            let rc = if let Some(fd) = fh {
-                unsafe { libc::ftruncate(fd as c_int, new_size as libc::off_t) }
+            // Check if there's an open writable file handle
+            let open_fh = fh.filter(|f| self.open_files.contains_key(f)).or_else(|| {
+                self.open_files
+                    .iter()
+                    .find(|(_, of)| of.inode == ino && of.writable)
+                    .map(|(&fh, _)| fh)
+            });
+
+            if let Some(fh) = open_fh {
+                if let Some(of) = self.open_files.get_mut(&fh) {
+                    of.data.resize(new_size as usize, 0);
+                    of.dirty = true;
+                }
             } else {
-                let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
-                unsafe { libc::truncate(c_path.as_ptr(), new_size as libc::off_t) }
-            };
-            if rc != 0 {
-                return reply.error(std::io::Error::last_os_error().raw_os_error().unwrap_or(libc::EIO));
+                // Load blob, truncate, write back
+                let old_hash = self
+                    .inode_meta
+                    .get(&ino)
+                    .and_then(|m| m.blob_hash.clone());
+                let mut data = old_hash
+                    .as_deref()
+                    .map(|h| self.read_blob(h))
+                    .unwrap_or_default();
+                data.resize(new_size as usize, 0);
+                let new_hash = if data.is_empty() {
+                    None
+                } else {
+                    Some(self.write_blob(&data))
+                };
+                if let Some(meta) = self.inode_meta.get_mut(&ino) {
+                    meta.blob_hash = new_hash;
+                }
+                if let Some(hash) = old_hash {
+                    self.delete_blob_if_unreferenced(&hash);
+                }
+            }
+
+            if let Some(meta) = self.inode_meta.get_mut(&ino) {
+                meta.size = new_size;
             }
         }
 
-        // chmod
         if let Some(new_mode) = mode {
-            let rc = if let Some(fd) = fh {
-                unsafe { libc::fchmod(fd as c_int, new_mode) }
-            } else {
-                let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
-                unsafe { libc::chmod(c_path.as_ptr(), new_mode) }
-            };
-            if rc != 0 {
-                return reply.error(std::io::Error::last_os_error().raw_os_error().unwrap_or(libc::EIO));
+            if let Some(meta) = self.inode_meta.get_mut(&ino) {
+                meta.permissions = (new_mode & 0o7777) as u16;
             }
         }
 
-        // chown
-        let new_uid = uid.map(|u| u as libc::uid_t).unwrap_or(u32::MAX);
-        let new_gid = gid.map(|g| g as libc::gid_t).unwrap_or(u32::MAX);
-        if uid.is_some() || gid.is_some() {
-            let rc = if let Some(fd) = fh {
-                unsafe { libc::fchown(fd as c_int, new_uid, new_gid) }
-            } else {
-                let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
-                unsafe { libc::lchown(c_path.as_ptr(), new_uid, new_gid) }
-            };
-            if rc != 0 {
-                return reply.error(std::io::Error::last_os_error().raw_os_error().unwrap_or(libc::EIO));
+        if let Some(new_uid) = uid {
+            if let Some(meta) = self.inode_meta.get_mut(&ino) {
+                meta.uid = new_uid;
             }
         }
 
-        // utimes
-        if atime.is_some() || mtime.is_some() {
-            // Get current times for any not being set
-            let current_attr = match self.get_attr(ino) {
-                Ok(a) => a,
-                Err(e) => return reply.error(e),
-            };
-
-            let atime_spec = match atime {
-                Some(t) => time_or_now_to_timespec(t),
-                None => system_time_to_timespec(current_attr.atime),
-            };
-            let mtime_spec = match mtime {
-                Some(t) => time_or_now_to_timespec(t),
-                None => system_time_to_timespec(current_attr.mtime),
-            };
-            let times = [atime_spec, mtime_spec];
-
-            let rc = if let Some(fd) = fh {
-                unsafe { libc::futimens(fd as c_int, times.as_ptr()) }
-            } else {
-                let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
-                unsafe { libc::utimensat(libc::AT_FDCWD, c_path.as_ptr(), times.as_ptr(), libc::AT_SYMLINK_NOFOLLOW) }
-            };
-            if rc != 0 {
-                return reply.error(std::io::Error::last_os_error().raw_os_error().unwrap_or(libc::EIO));
+        if let Some(new_gid) = gid {
+            if let Some(meta) = self.inode_meta.get_mut(&ino) {
+                meta.gid = new_gid;
             }
         }
 
-        match self.get_attr(ino) {
-            Ok(attr) => reply.attr(&TTL, &attr),
-            Err(e) => reply.error(e),
+        if let Some(t) = atime {
+            let (s, ns) = match t {
+                TimeOrNow::SpecificTime(st) => {
+                    let d = st.duration_since(UNIX_EPOCH).unwrap_or_default();
+                    (d.as_secs() as i64, d.subsec_nanos())
+                }
+                TimeOrNow::Now => now_timespec(),
+            };
+            if let Some(meta) = self.inode_meta.get_mut(&ino) {
+                meta.atime_secs = s;
+                meta.atime_nsecs = ns;
+            }
+        }
+
+        if let Some(t) = mtime {
+            let (s, ns) = match t {
+                TimeOrNow::SpecificTime(st) => {
+                    let d = st.duration_since(UNIX_EPOCH).unwrap_or_default();
+                    (d.as_secs() as i64, d.subsec_nanos())
+                }
+                TimeOrNow::Now => now_timespec(),
+            };
+            if let Some(meta) = self.inode_meta.get_mut(&ino) {
+                meta.mtime_secs = s;
+                meta.mtime_nsecs = ns;
+            }
+        }
+
+        // Update ctime for any metadata change
+        if let Some(meta) = self.inode_meta.get_mut(&ino) {
+            meta.ctime_secs = secs;
+            meta.ctime_nsecs = nsecs;
+        }
+
+        self.mark_dirty();
+
+        match self.inode_meta.get(&ino) {
+            Some(m) => {
+                let mut attr = m.to_file_attr();
+                // Reflect open buffer size
+                for of in self.open_files.values() {
+                    if of.inode == ino && of.writable {
+                        attr.size = of.data.len() as u64;
+                        attr.blocks = (attr.size + 511) / 512;
+                        break;
+                    }
+                }
+                reply.attr(&TTL, &attr);
+            }
+            None => reply.error(libc::ENOENT),
         }
     }
 
     fn readlink(&mut self, _req: &Request, ino: u64, reply: ReplyData) {
-        let path = match self.inode_to_path(ino) {
-            Ok(p) => p,
-            Err(e) => return reply.error(e),
-        };
-        match std::fs::read_link(&path) {
-            Ok(target) => reply.data(target.as_os_str().as_bytes()),
-            Err(e) => reply.error(e.raw_os_error().unwrap_or(libc::EIO)),
+        match self.inode_meta.get(&ino) {
+            Some(m) if m.symlink_target.is_some() => {
+                reply.data(m.symlink_target.as_ref().unwrap().as_bytes());
+            }
+            _ => reply.error(libc::ENOENT),
         }
     }
 
@@ -336,25 +692,56 @@ impl Filesystem for PassthroughFS {
         rdev: u32,
         reply: ReplyEntry,
     ) {
-        let parent_path = match self.inode_to_path(parent) {
-            Ok(p) => p,
-            Err(e) => return reply.error(e),
+        let name_str = match name.to_str() {
+            Some(s) => s,
+            None => return reply.error(libc::EINVAL),
         };
-        let path = parent_path.join(name);
-        let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
-        let rc = unsafe { libc::mknod(c_path.as_ptr(), mode, rdev as libc::dev_t) };
-        if rc != 0 {
-            return reply.error(std::io::Error::last_os_error().raw_os_error().unwrap_or(libc::EIO));
+
+        if !self.inode_meta.contains_key(&parent) {
+            return reply.error(libc::ENOENT);
         }
-        let rc = unsafe { libc::chown(c_path.as_ptr(), req.uid(), req.gid()) };
-        if rc != 0 {
-            return reply.error(std::io::Error::last_os_error().raw_os_error().unwrap_or(libc::EIO));
+
+        let ino = self.alloc_inode();
+        let (secs, nsecs) = now_timespec();
+        let ft = mode_to_file_type(mode);
+
+        self.inode_meta.insert(
+            ino,
+            InodeMeta {
+                inode: ino,
+                file_type: ft,
+                permissions: (mode & 0o7777) as u16,
+                uid: req.uid(),
+                gid: req.gid(),
+                size: 0,
+                nlink: 1,
+                atime_secs: secs,
+                atime_nsecs: nsecs,
+                mtime_secs: secs,
+                mtime_nsecs: nsecs,
+                ctime_secs: secs,
+                ctime_nsecs: nsecs,
+                blob_hash: None,
+                symlink_target: None,
+                rdev,
+            },
+        );
+
+        self.dir_entries
+            .insert((parent, name_str.to_string()), ino);
+
+        // Update parent mtime
+        if let Some(pmeta) = self.inode_meta.get_mut(&parent) {
+            pmeta.mtime_secs = secs;
+            pmeta.mtime_nsecs = nsecs;
+            pmeta.ctime_secs = secs;
+            pmeta.ctime_nsecs = nsecs;
         }
-        let attr = match self.get_attr_path(&path) {
-            Ok(a) => a,
-            Err(e) => return reply.error(e),
-        };
-        self.add_path(attr.ino, path);
+
+        *self.lookup_cnt.entry(ino).or_insert(0) += 1;
+        self.mark_dirty();
+
+        let attr = self.inode_meta.get(&ino).unwrap().to_file_attr();
         reply.entry(&TTL, &attr, 0);
     }
 
@@ -367,92 +754,200 @@ impl Filesystem for PassthroughFS {
         _umask: u32,
         reply: ReplyEntry,
     ) {
-        let parent_path = match self.inode_to_path(parent) {
-            Ok(p) => p,
-            Err(e) => return reply.error(e),
+        let name_str = match name.to_str() {
+            Some(s) => s,
+            None => return reply.error(libc::EINVAL),
         };
-        let path = parent_path.join(name);
-        let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
-        let rc = unsafe { libc::mkdir(c_path.as_ptr(), mode) };
-        if rc != 0 {
-            return reply.error(std::io::Error::last_os_error().raw_os_error().unwrap_or(libc::EIO));
+
+        if !self.inode_meta.contains_key(&parent) {
+            return reply.error(libc::ENOENT);
         }
-        let rc = unsafe { libc::chown(c_path.as_ptr(), req.uid(), req.gid()) };
-        if rc != 0 {
-            return reply.error(std::io::Error::last_os_error().raw_os_error().unwrap_or(libc::EIO));
+
+        let ino = self.alloc_inode();
+        let (secs, nsecs) = now_timespec();
+
+        self.inode_meta.insert(
+            ino,
+            InodeMeta {
+                inode: ino,
+                file_type: FileType::Directory,
+                permissions: (mode & 0o7777) as u16,
+                uid: req.uid(),
+                gid: req.gid(),
+                size: 0,
+                nlink: 2,
+                atime_secs: secs,
+                atime_nsecs: nsecs,
+                mtime_secs: secs,
+                mtime_nsecs: nsecs,
+                ctime_secs: secs,
+                ctime_nsecs: nsecs,
+                blob_hash: None,
+                symlink_target: None,
+                rdev: 0,
+            },
+        );
+
+        self.dir_entries
+            .insert((parent, name_str.to_string()), ino);
+
+        // Increment parent nlink
+        if let Some(pmeta) = self.inode_meta.get_mut(&parent) {
+            pmeta.nlink += 1;
+            pmeta.mtime_secs = secs;
+            pmeta.mtime_nsecs = nsecs;
+            pmeta.ctime_secs = secs;
+            pmeta.ctime_nsecs = nsecs;
         }
-        let attr = match self.get_attr_path(&path) {
-            Ok(a) => a,
-            Err(e) => return reply.error(e),
-        };
-        self.add_path(attr.ino, path);
+
+        *self.lookup_cnt.entry(ino).or_insert(0) += 1;
+        self.mark_dirty();
+
+        let attr = self.inode_meta.get(&ino).unwrap().to_file_attr();
         reply.entry(&TTL, &attr, 0);
     }
 
     fn unlink(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEmpty) {
-        let parent_path = match self.inode_to_path(parent) {
-            Ok(p) => p,
-            Err(e) => return reply.error(e),
+        let name_str = match name.to_str() {
+            Some(s) => s,
+            None => return reply.error(libc::EINVAL),
         };
-        let path = parent_path.join(name);
-        let ino = match std::fs::symlink_metadata(&path) {
-            Ok(m) => m.ino(),
-            Err(e) => return reply.error(e.raw_os_error().unwrap_or(libc::EIO)),
+
+        let child_ino = match self.dir_entries.remove(&(parent, name_str.to_string())) {
+            Some(ino) => ino,
+            None => return reply.error(libc::ENOENT),
         };
-        match std::fs::remove_file(&path) {
-            Ok(()) => {
-                if self.lookup_cnt.contains_key(&ino) {
-                    self.forget_path(ino, &path);
-                }
-                reply.ok();
-            }
-            Err(e) => reply.error(e.raw_os_error().unwrap_or(libc::EIO)),
+
+        let (secs, nsecs) = now_timespec();
+
+        // Update parent mtime
+        if let Some(pmeta) = self.inode_meta.get_mut(&parent) {
+            pmeta.mtime_secs = secs;
+            pmeta.mtime_nsecs = nsecs;
+            pmeta.ctime_secs = secs;
+            pmeta.ctime_nsecs = nsecs;
         }
+
+        // Decrement nlink
+        let should_remove = if let Some(meta) = self.inode_meta.get_mut(&child_ino) {
+            meta.nlink = meta.nlink.saturating_sub(1);
+            meta.ctime_secs = secs;
+            meta.ctime_nsecs = nsecs;
+            meta.nlink == 0
+        } else {
+            false
+        };
+
+        if should_remove {
+            let old_hash = self
+                .inode_meta
+                .remove(&child_ino)
+                .and_then(|m| m.blob_hash);
+            if let Some(hash) = old_hash {
+                self.delete_blob_if_unreferenced(&hash);
+            }
+        }
+
+        self.mark_dirty();
+        reply.ok();
     }
 
     fn rmdir(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEmpty) {
-        let parent_path = match self.inode_to_path(parent) {
-            Ok(p) => p,
-            Err(e) => return reply.error(e),
+        let name_str = match name.to_str() {
+            Some(s) => s,
+            None => return reply.error(libc::EINVAL),
         };
-        let path = parent_path.join(name);
-        let ino = match std::fs::symlink_metadata(&path) {
-            Ok(m) => m.ino(),
-            Err(e) => return reply.error(e.raw_os_error().unwrap_or(libc::EIO)),
+
+        let child_ino = match self.dir_entries.get(&(parent, name_str.to_string())) {
+            Some(&ino) => ino,
+            None => return reply.error(libc::ENOENT),
         };
-        match std::fs::remove_dir(&path) {
-            Ok(()) => {
-                if self.lookup_cnt.contains_key(&ino) {
-                    self.forget_path(ino, &path);
-                }
-                reply.ok();
-            }
-            Err(e) => reply.error(e.raw_os_error().unwrap_or(libc::EIO)),
+
+        // Check if directory is empty
+        let has_children = self.dir_entries.keys().any(|(p, _)| *p == child_ino);
+        if has_children {
+            return reply.error(libc::ENOTEMPTY);
         }
+
+        self.dir_entries.remove(&(parent, name_str.to_string()));
+        self.inode_meta.remove(&child_ino);
+
+        let (secs, nsecs) = now_timespec();
+
+        // Decrement parent nlink
+        if let Some(pmeta) = self.inode_meta.get_mut(&parent) {
+            pmeta.nlink = pmeta.nlink.saturating_sub(1);
+            pmeta.mtime_secs = secs;
+            pmeta.mtime_nsecs = nsecs;
+            pmeta.ctime_secs = secs;
+            pmeta.ctime_nsecs = nsecs;
+        }
+
+        self.mark_dirty();
+        reply.ok();
     }
 
     fn symlink(
         &mut self,
-        _req: &Request,
+        req: &Request,
         parent: u64,
         link_name: &OsStr,
         target: &Path,
         reply: ReplyEntry,
     ) {
-        let parent_path = match self.inode_to_path(parent) {
-            Ok(p) => p,
-            Err(e) => return reply.error(e),
+        let name_str = match link_name.to_str() {
+            Some(s) => s,
+            None => return reply.error(libc::EINVAL),
         };
-        let path = parent_path.join(link_name);
-        match std::os::unix::fs::symlink(target, &path) {
-            Ok(()) => {}
-            Err(e) => return reply.error(e.raw_os_error().unwrap_or(libc::EIO)),
+
+        if !self.inode_meta.contains_key(&parent) {
+            return reply.error(libc::ENOENT);
         }
-        let attr = match self.get_attr_path(&path) {
-            Ok(a) => a,
-            Err(e) => return reply.error(e),
+
+        let target_str = match target.to_str() {
+            Some(s) => s.to_string(),
+            None => return reply.error(libc::EINVAL),
         };
-        self.add_path(attr.ino, path);
+
+        let ino = self.alloc_inode();
+        let (secs, nsecs) = now_timespec();
+
+        self.inode_meta.insert(
+            ino,
+            InodeMeta {
+                inode: ino,
+                file_type: FileType::Symlink,
+                permissions: 0o777,
+                uid: req.uid(),
+                gid: req.gid(),
+                size: target_str.len() as u64,
+                nlink: 1,
+                atime_secs: secs,
+                atime_nsecs: nsecs,
+                mtime_secs: secs,
+                mtime_nsecs: nsecs,
+                ctime_secs: secs,
+                ctime_nsecs: nsecs,
+                blob_hash: None,
+                symlink_target: Some(target_str),
+                rdev: 0,
+            },
+        );
+
+        self.dir_entries
+            .insert((parent, name_str.to_string()), ino);
+
+        if let Some(pmeta) = self.inode_meta.get_mut(&parent) {
+            pmeta.mtime_secs = secs;
+            pmeta.mtime_nsecs = nsecs;
+            pmeta.ctime_secs = secs;
+            pmeta.ctime_nsecs = nsecs;
+        }
+
+        *self.lookup_cnt.entry(ino).or_insert(0) += 1;
+        self.mark_dirty();
+
+        let attr = self.inode_meta.get(&ino).unwrap().to_file_attr();
         reply.entry(&TTL, &attr, 0);
     }
 
@@ -466,38 +961,55 @@ impl Filesystem for PassthroughFS {
         _flags: u32,
         reply: ReplyEmpty,
     ) {
-        let parent_path = match self.inode_to_path(parent) {
-            Ok(p) => p,
-            Err(e) => return reply.error(e),
+        let old_name = match name.to_str() {
+            Some(s) => s.to_string(),
+            None => return reply.error(libc::EINVAL),
         };
-        let new_parent_path = match self.inode_to_path(newparent) {
-            Ok(p) => p,
-            Err(e) => return reply.error(e),
+        let new_name = match newname.to_str() {
+            Some(s) => s.to_string(),
+            None => return reply.error(libc::EINVAL),
         };
-        let old_path = parent_path.join(name);
-        let new_path = new_parent_path.join(newname);
-        match std::fs::rename(&old_path, &new_path) {
-            Ok(()) => {}
-            Err(e) => return reply.error(e.raw_os_error().unwrap_or(libc::EIO)),
-        }
-        let ino = match std::fs::symlink_metadata(&new_path) {
-            Ok(m) => m.ino(),
-            Err(e) => return reply.error(e.raw_os_error().unwrap_or(libc::EIO)),
+
+        let child_ino = match self.dir_entries.remove(&(parent, old_name)) {
+            Some(ino) => ino,
+            None => return reply.error(libc::ENOENT),
         };
-        if self.lookup_cnt.contains_key(&ino) {
-            match self.inode_path_map.get_mut(&ino) {
-                Some(InodePaths::Multi(set)) => {
-                    set.retain(|p| p != &old_path);
-                    if !set.contains(&new_path) {
-                        set.push(new_path);
+
+        // If target exists, remove it
+        if let Some(replaced_ino) = self.dir_entries.remove(&(newparent, new_name.clone())) {
+            if let Some(meta) = self.inode_meta.get_mut(&replaced_ino) {
+                meta.nlink = meta.nlink.saturating_sub(1);
+                if meta.nlink == 0 {
+                    let old_hash = self
+                        .inode_meta
+                        .remove(&replaced_ino)
+                        .and_then(|m| m.blob_hash);
+                    if let Some(hash) = old_hash {
+                        self.delete_blob_if_unreferenced(&hash);
                     }
                 }
-                Some(entry @ InodePaths::Single(_)) => {
-                    *entry = InodePaths::Single(new_path);
-                }
-                None => {}
             }
         }
+
+        self.dir_entries.insert((newparent, new_name), child_ino);
+
+        let (secs, nsecs) = now_timespec();
+        if let Some(pmeta) = self.inode_meta.get_mut(&parent) {
+            pmeta.mtime_secs = secs;
+            pmeta.mtime_nsecs = nsecs;
+            pmeta.ctime_secs = secs;
+            pmeta.ctime_nsecs = nsecs;
+        }
+        if newparent != parent {
+            if let Some(pmeta) = self.inode_meta.get_mut(&newparent) {
+                pmeta.mtime_secs = secs;
+                pmeta.mtime_nsecs = nsecs;
+                pmeta.ctime_secs = secs;
+                pmeta.ctime_nsecs = nsecs;
+            }
+        }
+
+        self.mark_dirty();
         reply.ok();
     }
 
@@ -509,46 +1021,67 @@ impl Filesystem for PassthroughFS {
         newname: &OsStr,
         reply: ReplyEntry,
     ) {
-        let src_path = match self.inode_to_path(ino) {
-            Ok(p) => p,
-            Err(e) => return reply.error(e),
+        let name_str = match newname.to_str() {
+            Some(s) => s,
+            None => return reply.error(libc::EINVAL),
         };
-        let new_parent_path = match self.inode_to_path(newparent) {
-            Ok(p) => p,
-            Err(e) => return reply.error(e),
-        };
-        let new_path = new_parent_path.join(newname);
-        match std::fs::hard_link(&src_path, &new_path) {
-            Ok(()) => {}
-            Err(e) => return reply.error(e.raw_os_error().unwrap_or(libc::EIO)),
+
+        if !self.inode_meta.contains_key(&ino) || !self.inode_meta.contains_key(&newparent) {
+            return reply.error(libc::ENOENT);
         }
-        self.add_path(ino, new_path);
-        match self.get_attr(ino) {
-            Ok(attr) => reply.entry(&TTL, &attr, 0),
-            Err(e) => reply.error(e),
+
+        let (secs, nsecs) = now_timespec();
+
+        if let Some(meta) = self.inode_meta.get_mut(&ino) {
+            meta.nlink += 1;
+            meta.ctime_secs = secs;
+            meta.ctime_nsecs = nsecs;
         }
+
+        self.dir_entries
+            .insert((newparent, name_str.to_string()), ino);
+
+        if let Some(pmeta) = self.inode_meta.get_mut(&newparent) {
+            pmeta.mtime_secs = secs;
+            pmeta.mtime_nsecs = nsecs;
+            pmeta.ctime_secs = secs;
+            pmeta.ctime_nsecs = nsecs;
+        }
+
+        *self.lookup_cnt.entry(ino).or_insert(0) += 1;
+        self.mark_dirty();
+
+        let attr = self.inode_meta.get(&ino).unwrap().to_file_attr();
+        reply.entry(&TTL, &attr, 0);
     }
 
     fn open(&mut self, _req: &Request, ino: u64, flags: i32, reply: ReplyOpen) {
-        if let Some(&fd) = self.inode_fd_map.get(&ino) {
-            *self.fd_open_count.get_mut(&fd).unwrap() += 1;
-            return reply.opened(fd as u64, 0);
-        }
-        let path = match self.inode_to_path(ino) {
-            Ok(p) => p,
-            Err(e) => return reply.error(e),
+        let meta = match self.inode_meta.get(&ino) {
+            Some(m) => m,
+            None => return reply.error(libc::ENOENT),
         };
-        let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
-        // Strip O_CREAT and O_TRUNC since open() should only open existing files
-        let open_flags = flags & !(libc::O_CREAT | libc::O_TRUNC);
-        let fd = unsafe { libc::open(c_path.as_ptr(), open_flags) };
-        if fd < 0 {
-            return reply.error(std::io::Error::last_os_error().raw_os_error().unwrap_or(libc::EIO));
-        }
-        self.inode_fd_map.insert(ino, fd);
-        self.fd_inode_map.insert(fd, ino);
-        self.fd_open_count.insert(fd, 1);
-        reply.opened(fd as u64, 0);
+
+        let access_mode = flags & libc::O_ACCMODE;
+        let writable = access_mode == libc::O_WRONLY || access_mode == libc::O_RDWR;
+
+        let data = meta
+            .blob_hash
+            .as_deref()
+            .map(|h| self.read_blob(h))
+            .unwrap_or_default();
+
+        let fh = self.alloc_fh();
+        self.open_files.insert(
+            fh,
+            OpenFile {
+                inode: ino,
+                data,
+                writable,
+                dirty: false,
+            },
+        );
+
+        reply.opened(fh, 0);
     }
 
     fn read(
@@ -562,15 +1095,18 @@ impl Filesystem for PassthroughFS {
         _lock_owner: Option<u64>,
         reply: ReplyData,
     ) {
-        let fd = fh as c_int;
-        unsafe { libc::lseek(fd, offset, libc::SEEK_SET) };
-        let mut buf = vec![0u8; size as usize];
-        let n = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, size as usize) };
-        if n < 0 {
-            return reply.error(std::io::Error::last_os_error().raw_os_error().unwrap_or(libc::EIO));
+        let open_file = match self.open_files.get(&fh) {
+            Some(f) => f,
+            None => return reply.error(libc::EBADF),
+        };
+
+        let offset = offset as usize;
+        if offset >= open_file.data.len() {
+            return reply.data(&[]);
         }
-        buf.truncate(n as usize);
-        reply.data(&buf);
+
+        let end = std::cmp::min(offset + size as usize, open_file.data.len());
+        reply.data(&open_file.data[offset..end]);
     }
 
     fn write(
@@ -585,21 +1121,33 @@ impl Filesystem for PassthroughFS {
         _lock_owner: Option<u64>,
         reply: ReplyWrite,
     ) {
-        let fd = fh as c_int;
-        unsafe { libc::lseek(fd, offset, libc::SEEK_SET) };
-        let n = unsafe { libc::write(fd, data.as_ptr() as *const libc::c_void, data.len()) };
-        if n < 0 {
-            return reply.error(std::io::Error::last_os_error().raw_os_error().unwrap_or(libc::EIO));
+        let open_file = match self.open_files.get_mut(&fh) {
+            Some(f) => f,
+            None => return reply.error(libc::EBADF),
+        };
+
+        let offset = offset as usize;
+        let end = offset + data.len();
+
+        if end > open_file.data.len() {
+            open_file.data.resize(end, 0);
         }
-        reply.written(n as u32);
+
+        open_file.data[offset..end].copy_from_slice(data);
+        open_file.dirty = true;
+
+        reply.written(data.len() as u32);
     }
 
-    fn flush(&mut self, _req: &Request, _ino: u64, fh: u64, _lock_owner: u64, reply: ReplyEmpty) {
-        let fd = fh as c_int;
-        let dup_fd = unsafe { libc::dup(fd) };
-        if dup_fd >= 0 {
-            unsafe { libc::close(dup_fd) };
-        }
+    fn flush(
+        &mut self,
+        _req: &Request,
+        _ino: u64,
+        fh: u64,
+        _lock_owner: u64,
+        reply: ReplyEmpty,
+    ) {
+        self.flush_open_file(fh);
         reply.ok();
     }
 
@@ -613,40 +1161,16 @@ impl Filesystem for PassthroughFS {
         _flush: bool,
         reply: ReplyEmpty,
     ) {
-        let fd = fh as c_int;
-        if let Some(count) = self.fd_open_count.get_mut(&fd) {
-            if *count > 1 {
-                *count -= 1;
-                return reply.ok();
-            }
-        }
-        self.fd_open_count.remove(&fd);
-        if let Some(ino) = self.fd_inode_map.remove(&fd) {
-            self.inode_fd_map.remove(&ino);
-        }
-        unsafe { libc::close(fd) };
+        self.flush_open_file(fh);
+        self.open_files.remove(&fh);
         reply.ok();
     }
 
-    fn fsync(&mut self, _req: &Request, _ino: u64, fh: u64, datasync: bool, reply: ReplyEmpty) {
-        let fd = fh as c_int;
-        let rc = if datasync {
-            unsafe { libc::fdatasync(fd) }
-        } else {
-            unsafe { libc::fsync(fd) }
-        };
-        if rc != 0 {
-            reply.error(std::io::Error::last_os_error().raw_os_error().unwrap_or(libc::EIO));
-        } else {
-            reply.ok();
-        }
-    }
-
     fn opendir(&mut self, _req: &Request, ino: u64, _flags: i32, reply: ReplyOpen) {
-        // Just verify the inode exists
-        match self.inode_to_path(ino) {
-            Ok(_) => reply.opened(ino, 0),
-            Err(e) => reply.error(e),
+        if self.inode_meta.contains_key(&ino) {
+            reply.opened(ino, 0);
+        } else {
+            reply.error(libc::ENOENT);
         }
     }
 
@@ -658,61 +1182,47 @@ impl Filesystem for PassthroughFS {
         offset: i64,
         mut reply: ReplyDirectory,
     ) {
-        let path = match self.inode_to_path(ino) {
-            Ok(p) => p,
-            Err(e) => return reply.error(e),
-        };
-        let entries = match std::fs::read_dir(&path) {
-            Ok(rd) => rd,
-            Err(e) => return reply.error(e.raw_os_error().unwrap_or(libc::EIO)),
-        };
-        // Collect and sort by inode like the Python version
-        let mut entry_list: Vec<(u64, std::ffi::OsString, FileType)> = Vec::new();
-        for entry in entries {
-            let entry = match entry {
-                Ok(e) => e,
-                Err(_) => continue,
-            };
-            let meta = match entry.metadata() {
-                Ok(m) => m,
-                Err(_) => continue,
-            };
-            let ft = mode_to_file_type(meta.mode());
-            entry_list.push((meta.ino(), entry.file_name(), ft));
+        if !self.inode_meta.contains_key(&ino) {
+            return reply.error(libc::ENOENT);
         }
-        entry_list.sort_by_key(|(ino, _, _)| *ino);
 
-        for (i, (entry_ino, name, ft)) in entry_list.iter().enumerate() {
-            let entry_offset = (i + 1) as i64;
+        let parent_ino = self.parent_of(ino);
+
+        let mut entries: Vec<(i64, u64, FileType, String)> = Vec::new();
+        entries.push((1, ino, FileType::Directory, ".".to_string()));
+        entries.push((2, parent_ino, FileType::Directory, "..".to_string()));
+
+        let mut children: Vec<(String, u64)> = self
+            .dir_entries
+            .iter()
+            .filter(|((p, _), _)| *p == ino)
+            .map(|((_, name), &child)| (name.clone(), child))
+            .collect();
+        children.sort_by(|a, b| a.0.cmp(&b.0));
+
+        for (i, (name, child_ino)) in children.into_iter().enumerate() {
+            let ft = self
+                .inode_meta
+                .get(&child_ino)
+                .map(|m| m.file_type)
+                .unwrap_or(FileType::RegularFile);
+            entries.push(((i + 3) as i64, child_ino, ft, name));
+        }
+
+        for (entry_offset, entry_ino, ft, name) in entries {
             if entry_offset <= offset {
                 continue;
             }
-            let full_path = path.join(&name);
-            if reply.add(*entry_ino, entry_offset, *ft, &name) {
+            if reply.add(entry_ino, entry_offset, ft, &name) {
                 break;
             }
-            self.add_path(*entry_ino, full_path);
         }
         reply.ok();
     }
 
-    fn access(&mut self, _req: &Request, ino: u64, mask: i32, reply: ReplyEmpty) {
-        let path = match self.inode_to_path(ino) {
-            Ok(p) => p,
-            Err(e) => return reply.error(e),
-        };
-        let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
-        let rc = unsafe { libc::access(c_path.as_ptr(), mask) };
-        if rc == 0 {
-            reply.ok();
-        } else {
-            reply.error(std::io::Error::last_os_error().raw_os_error().unwrap_or(libc::EACCES));
-        }
-    }
-
     fn create(
         &mut self,
-        _req: &Request,
+        req: &Request,
         parent: u64,
         name: &OsStr,
         mode: u32,
@@ -720,40 +1230,89 @@ impl Filesystem for PassthroughFS {
         flags: i32,
         reply: ReplyCreate,
     ) {
-        let parent_path = match self.inode_to_path(parent) {
-            Ok(p) => p,
-            Err(e) => return reply.error(e),
+        let name_str = match name.to_str() {
+            Some(s) => s,
+            None => return reply.error(libc::EINVAL),
         };
-        let path = parent_path.join(name);
-        let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
-        let fd = unsafe { libc::open(c_path.as_ptr(), flags | libc::O_CREAT | libc::O_TRUNC, mode) };
-        if fd < 0 {
-            return reply.error(std::io::Error::last_os_error().raw_os_error().unwrap_or(libc::EIO));
+
+        if !self.inode_meta.contains_key(&parent) {
+            return reply.error(libc::ENOENT);
         }
-        let attr = match self.get_attr_fd(fd) {
-            Ok(a) => a,
-            Err(e) => {
-                unsafe { libc::close(fd) };
-                return reply.error(e);
-            }
-        };
-        self.add_path(attr.ino, path);
-        self.inode_fd_map.insert(attr.ino, fd);
-        self.fd_inode_map.insert(fd, attr.ino);
-        self.fd_open_count.insert(fd, 1);
-        reply.created(&TTL, &attr, 0, fd as u64, 0);
+
+        let ino = self.alloc_inode();
+        let (secs, nsecs) = now_timespec();
+        let access_mode = flags & libc::O_ACCMODE;
+        let writable = access_mode == libc::O_WRONLY || access_mode == libc::O_RDWR;
+
+        self.inode_meta.insert(
+            ino,
+            InodeMeta {
+                inode: ino,
+                file_type: FileType::RegularFile,
+                permissions: (mode & 0o7777) as u16,
+                uid: req.uid(),
+                gid: req.gid(),
+                size: 0,
+                nlink: 1,
+                atime_secs: secs,
+                atime_nsecs: nsecs,
+                mtime_secs: secs,
+                mtime_nsecs: nsecs,
+                ctime_secs: secs,
+                ctime_nsecs: nsecs,
+                blob_hash: None,
+                symlink_target: None,
+                rdev: 0,
+            },
+        );
+
+        self.dir_entries
+            .insert((parent, name_str.to_string()), ino);
+
+        if let Some(pmeta) = self.inode_meta.get_mut(&parent) {
+            pmeta.mtime_secs = secs;
+            pmeta.mtime_nsecs = nsecs;
+            pmeta.ctime_secs = secs;
+            pmeta.ctime_nsecs = nsecs;
+        }
+
+        let fh = self.alloc_fh();
+        self.open_files.insert(
+            fh,
+            OpenFile {
+                inode: ino,
+                data: Vec::new(),
+                writable,
+                dirty: false,
+            },
+        );
+
+        *self.lookup_cnt.entry(ino).or_insert(0) += 1;
+        self.mark_dirty();
+
+        let attr = self.inode_meta.get(&ino).unwrap().to_file_attr();
+        reply.created(&TTL, &attr, 0, fh, 0);
+    }
+
+    fn access(&mut self, _req: &Request, ino: u64, _mask: i32, reply: ReplyEmpty) {
+        if self.inode_meta.contains_key(&ino) {
+            reply.ok();
+        } else {
+            reply.error(libc::ENOENT);
+        }
     }
 
     fn statfs(&mut self, _req: &Request, _ino: u64, reply: ReplyStatfs) {
-        let root = match self.inode_path_map.get(&FUSE_ROOT_INODE) {
-            Some(InodePaths::Single(p)) => p.clone(),
-            _ => return reply.error(libc::ENOENT),
-        };
-        let c_path = std::ffi::CString::new(root.as_os_str().as_bytes()).unwrap();
+        let c_path =
+            std::ffi::CString::new(self.data_dir.as_os_str().as_bytes()).unwrap();
         let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
         let rc = unsafe { libc::statvfs(c_path.as_ptr(), &mut stat) };
         if rc != 0 {
-            return reply.error(std::io::Error::last_os_error().raw_os_error().unwrap_or(libc::EIO));
+            return reply.error(
+                std::io::Error::last_os_error()
+                    .raw_os_error()
+                    .unwrap_or(libc::EIO),
+            );
         }
         reply.statfs(
             stat.f_blocks,

@@ -1,89 +1,100 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SOURCE=$(mktemp -d)
+DATA=$(mktemp -d)
 MOUNT=$(mktemp -d)
 NOFS_PID=
 
 cleanup() {
     fusermount -u "$MOUNT" 2>/dev/null || fusermount3 -u "$MOUNT" 2>/dev/null || true
     [[ -n "$NOFS_PID" ]] && wait "$NOFS_PID" 2>/dev/null || true
-    rm -rf "$SOURCE" "$MOUNT"
+    rm -rf "$DATA" "$MOUNT"
 }
 trap cleanup EXIT
 
 fail() { echo "FAIL: $1" >&2; exit 1; }
 
-# Seed source directory
-echo "hello world" > "$SOURCE/test.txt"
-mkdir "$SOURCE/subdir"
-echo "nested" > "$SOURCE/subdir/nested.txt"
+start_mount() {
+    ./target/release/nofs --no-ui "$DATA" "$MOUNT" &
+    NOFS_PID=$!
+    for i in $(seq 1 10); do
+        if mountpoint -q "$MOUNT" 2>/dev/null; then
+            break
+        fi
+        sleep 0.5
+    done
+    mountpoint -q "$MOUNT" || fail "mount not ready after 5s"
+}
 
-# Mount
+stop_mount() {
+    fusermount -u "$MOUNT" 2>/dev/null || fusermount3 -u "$MOUNT" 2>/dev/null || true
+    wait "$NOFS_PID" 2>/dev/null || true
+    NOFS_PID=
+}
+
+# Build
 cargo build --release 2>&1
-./target/release/nofs --no-ui "$SOURCE" "$MOUNT" &
-NOFS_PID=$!
 
-# Wait for mount to be ready
-for i in $(seq 1 10); do
-    if mountpoint -q "$MOUNT" 2>/dev/null; then
-        break
-    fi
-    sleep 0.5
-done
-mountpoint -q "$MOUNT" || fail "mount not ready after 5s"
+# First mount
+start_mount
 
-# Test: list files
-[[ -f "$MOUNT/test.txt" ]] || fail "test.txt not visible in mount"
-echo "PASS: file visible"
+# Test: write and read file
+echo "hello world" > "$MOUNT/test.txt"
+[[ "$(cat "$MOUNT/test.txt")" == "hello world" ]] || fail "write/read mismatch"
+echo "PASS: write and read file"
 
-# Test: read file
-[[ "$(cat "$MOUNT/test.txt")" == "hello world" ]] || fail "read content mismatch"
-echo "PASS: read file"
-
-# Test: read nested file
-[[ "$(cat "$MOUNT/subdir/nested.txt")" == "nested" ]] || fail "nested read mismatch"
-echo "PASS: read nested file"
-
-# Test: write file
-echo "new content" > "$MOUNT/write-test.txt"
-[[ "$(cat "$SOURCE/write-test.txt")" == "new content" ]] || fail "write not passthrough"
-echo "PASS: write file"
+# Test: write and read nested file
+mkdir "$MOUNT/subdir"
+echo "nested" > "$MOUNT/subdir/nested.txt"
+[[ "$(cat "$MOUNT/subdir/nested.txt")" == "nested" ]] || fail "nested write/read mismatch"
+echo "PASS: write and read nested file"
 
 # Test: append
-echo "appended" >> "$MOUNT/write-test.txt"
-grep -q "appended" "$SOURCE/write-test.txt" || fail "append failed"
+echo "appended" >> "$MOUNT/test.txt"
+grep -q "appended" "$MOUNT/test.txt" || fail "append failed"
 echo "PASS: append file"
 
 # Test: mkdir
 mkdir "$MOUNT/newdir"
-[[ -d "$SOURCE/newdir" ]] || fail "mkdir not passthrough"
+[[ -d "$MOUNT/newdir" ]] || fail "mkdir failed"
 echo "PASS: mkdir"
 
 # Test: remove file
-rm "$MOUNT/write-test.txt"
-[[ ! -f "$SOURCE/write-test.txt" ]] || fail "unlink not passthrough"
+echo "deleteme" > "$MOUNT/todelete.txt"
+rm "$MOUNT/todelete.txt"
+[[ ! -f "$MOUNT/todelete.txt" ]] || fail "unlink failed"
 echo "PASS: unlink"
 
 # Test: rmdir
 rmdir "$MOUNT/newdir"
-[[ ! -d "$SOURCE/newdir" ]] || fail "rmdir not passthrough"
+[[ ! -d "$MOUNT/newdir" ]] || fail "rmdir failed"
 echo "PASS: rmdir"
 
 # Test: rename
 echo "moveme" > "$MOUNT/before.txt"
 mv "$MOUNT/before.txt" "$MOUNT/after.txt"
-[[ ! -f "$SOURCE/before.txt" && "$(cat "$SOURCE/after.txt")" == "moveme" ]] || fail "rename failed"
+[[ ! -f "$MOUNT/before.txt" ]] || fail "rename: old still exists"
+[[ "$(cat "$MOUNT/after.txt")" == "moveme" ]] || fail "rename: content mismatch"
 echo "PASS: rename"
 
 # Test: symlink
-ln -s "$MOUNT/test.txt" "$MOUNT/link.txt"
-[[ "$(cat "$MOUNT/link.txt")" == "hello world" ]] || fail "symlink read failed"
+ln -s "test.txt" "$MOUNT/link.txt"
+[[ "$(readlink "$MOUNT/link.txt")" == "test.txt" ]] || fail "symlink target mismatch"
 echo "PASS: symlink"
 
 # Test: stat
-[[ "$(stat -c %s "$MOUNT/test.txt")" == "$(stat -c %s "$SOURCE/test.txt")" ]] || fail "stat size mismatch"
+SIZE=$(stat -c %s "$MOUNT/test.txt")
+[[ "$SIZE" -gt 0 ]] || fail "stat size is 0"
 echo "PASS: stat"
+
+# Test: persistence (unmount, remount, verify)
+stop_mount
+start_mount
+grep -q "hello world" "$MOUNT/test.txt" || fail "persistence: test.txt content lost"
+grep -q "appended" "$MOUNT/test.txt" || fail "persistence: test.txt append lost"
+[[ "$(cat "$MOUNT/subdir/nested.txt")" == "nested" ]] || fail "persistence: nested.txt lost"
+[[ "$(cat "$MOUNT/after.txt")" == "moveme" ]] || fail "persistence: after.txt lost"
+echo "PASS: persistence"
 
 echo ""
 echo "All tests passed."

@@ -14,7 +14,13 @@ Tests mount a real FUSE filesystem with `--no-ui`, run assertions, then clean up
 
 ## Architecture
 
-Passthrough FUSE filesystem in Rust with an eframe/egui GUI window.
+FUSE filesystem in Rust with content-addressed blob storage, Polars/AVRO metadata persistence, and an eframe/egui GUI window.
+
+**Storage model:**
+- Metadata (inodes + directory entries) stored in-memory as `HashMap`s, persisted to `metadata.avro` via Polars DataFrames
+- File content stored as SHA-256-addressed blobs under `blobs/<hash[..2]>/<hash[2..]>`
+- AVRO is denormalized: one row per directory entry, with full inode metadata joined in. Root inode stored with `parent_inode=0`.
+- Metadata flushes on `destroy()` and periodically (every 30s if dirty)
 
 **Two-thread model (default):**
 - Main thread: `eframe::run_native()` — GUI event loop showing a window
@@ -26,4 +32,4 @@ Passthrough FUSE filesystem in Rust with an eframe/egui GUI window.
 
 **Key files:**
 - `src/main.rs` — CLI (clap), thread orchestration, GUI (`NofsApp` struct)
-- `src/fs.rs` — `fuser::Filesystem` implementation (~770 lines). Maintains inode↔path maps, fd tracking, and delegates all ops to the underlying filesystem via unsafe libc calls
+- `src/fs.rs` — `NofsFS` struct implementing `fuser::Filesystem`. In-memory inode metadata (`HashMap<u64, InodeMeta>`), directory entries (`HashMap<(u64, String), u64>`), open file buffers (`HashMap<u64, OpenFile>`), blob read/write helpers, and Polars AVRO serialization

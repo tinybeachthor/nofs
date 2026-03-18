@@ -1,16 +1,16 @@
 mod fs;
 
 use clap::Parser;
-use fs::PassthroughFS;
-use fuser::MountOption;
 use eframe::egui;
+use fs::NofsFS;
+use fuser::MountOption;
 use std::path::PathBuf;
 
 #[derive(Parser)]
-#[command(name = "nofs", about = "Mount a directory as a passthrough FUSE filesystem")]
+#[command(name = "nofs", about = "A FUSE filesystem with content-addressed storage")]
 struct Args {
-    /// Source directory to mirror
-    source: PathBuf,
+    /// Data directory for metadata and blobs
+    data_dir: PathBuf,
 
     /// Directory to mount the filesystem at
     mountpoint: PathBuf,
@@ -55,7 +55,10 @@ fn main() {
             .init();
     }
 
-    let source = std::fs::canonicalize(&args.source).expect("Failed to canonicalize source path");
+    // Create data directory and blobs subdirectory
+    std::fs::create_dir_all(args.data_dir.join("blobs")).expect("Failed to create data directory");
+
+    let data_dir = std::fs::canonicalize(&args.data_dir).expect("Failed to canonicalize data dir");
     let mountpoint = args.mountpoint.clone();
 
     let mut options = vec![
@@ -67,7 +70,7 @@ fn main() {
         options.push(MountOption::AllowOther);
     }
 
-    let fuse_fs = PassthroughFS::new(source);
+    let fuse_fs = NofsFS::new(data_dir);
 
     if args.no_ui {
         fuser::mount2(fuse_fs, &args.mountpoint, &options).expect("Failed to mount filesystem");
