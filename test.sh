@@ -21,7 +21,7 @@ echo "nested" > "$SOURCE/subdir/nested.txt"
 
 # Mount
 cargo build --release 2>&1
-./target/release/nofs "$SOURCE" "$MOUNT" &
+./target/release/nofs --no-ui "$SOURCE" "$MOUNT" &
 NOFS_PID=$!
 
 # Wait for mount to be ready

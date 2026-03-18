@@ -19,8 +19,18 @@
           pkgs.cargo-edit
           pkgs.git
           pkgs.fuse3
+          pkgs.wayland
+          pkgs.libxkbcommon
+          pkgs.xorg.libxcb
+          pkgs.fontconfig
+          pkgs.libGL
         ];
         RUST_SRC_PATH = "${toolchain}/lib/rustlib/src/rust/library";
+        LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath [
+          pkgs.wayland
+          pkgs.libxkbcommon
+          pkgs.libGL
+        ];
       };
     };
 }
