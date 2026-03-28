@@ -6,6 +6,7 @@ use libc;
 use polars::prelude::*;
 use polars::io::avro::{AvroReader, AvroWriter};
 use sha2::{Digest, Sha256};
+use fastcdc::v2020::FastCDC;
 
 use std::collections::HashMap;
 use std::ffi::OsStr;
@@ -16,7 +17,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 const TTL: Duration = Duration::from_secs(1);
 const FUSE_ROOT_INODE: u64 = 1;
 const FLUSH_INTERVAL: Duration = Duration::from_secs(30);
-const CHUNK_SIZE: usize = 1024 * 1024; // 1MB
+const CDC_MIN_SIZE: u32 = 512 * 1024;      // 512 KB
+const CDC_AVG_SIZE: u32 = 1024 * 1024;     // 1 MB
+const CDC_MAX_SIZE: u32 = 2 * 1024 * 1024; // 2 MB
 
 fn now_timespec() -> (i64, u32) {
     let d = SystemTime::now()
@@ -204,6 +207,15 @@ impl NofsFS {
             std::fs::rename(&tmp, &path).expect("Failed to rename blob");
         }
         hash
+    }
+
+    fn cdc_chunk_and_write(&self, data: &[u8]) -> Vec<String> {
+        if data.is_empty() {
+            return vec![];
+        }
+        FastCDC::new(data, CDC_MIN_SIZE, CDC_AVG_SIZE, CDC_MAX_SIZE)
+            .map(|chunk| self.write_blob(&data[chunk.offset..chunk.offset + chunk.length]))
+            .collect()
     }
 
     fn delete_blob_if_unreferenced(&self, hash: &str) {
@@ -442,13 +454,7 @@ impl NofsFS {
             .map(|m| m.blob_hashes.clone())
             .unwrap_or_default();
 
-        let new_hashes: Vec<String> = if data.is_empty() {
-            vec![]
-        } else {
-            data.chunks(CHUNK_SIZE)
-                .map(|chunk| self.write_blob(chunk))
-                .collect()
-        };
+        let new_hashes = self.cdc_chunk_and_write(&data);
 
         if let Some(meta) = self.inode_meta.get_mut(&inode) {
             meta.blob_hashes = new_hashes;
@@ -595,13 +601,7 @@ impl Filesystem for NofsFS {
                     buf
                 };
                 data.resize(new_size as usize, 0);
-                let new_hashes: Vec<String> = if data.is_empty() {
-                    vec![]
-                } else {
-                    data.chunks(CHUNK_SIZE)
-                        .map(|chunk| self.write_blob(chunk))
-                        .collect()
-                };
+                let new_hashes = self.cdc_chunk_and_write(&data);
                 if let Some(meta) = self.inode_meta.get_mut(&ino) {
                     meta.blob_hashes = new_hashes;
                 }
