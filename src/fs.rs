@@ -7,7 +7,8 @@ use polars::prelude::*;
 use polars::io::avro::{AvroReader, AvroWriter};
 use sha2::{Digest, Sha256};
 use fastcdc::v2020::FastCDC;
-use reed_solomon_erasure::galois_8::ReedSolomon;
+
+use crate::reed_solomon;
 
 use std::collections::HashMap;
 use std::ffi::OsStr;
@@ -21,110 +22,6 @@ const FLUSH_INTERVAL: Duration = Duration::from_secs(30);
 const CDC_MIN_SIZE: u32 = 512 * 1024;      // 512 KB
 const CDC_AVG_SIZE: u32 = 1024 * 1024;     // 1 MB
 const CDC_MAX_SIZE: u32 = 2 * 1024 * 1024; // 2 MB
-
-// Reed-Solomon parameters: 10 data shards + 4 parity shards (tolerates up to 4 shard losses)
-const RS_DATA_SHARDS: usize = 10;
-const RS_PARITY_SHARDS: usize = 4;
-
-/// Encode raw blob data with Reed-Solomon error correction.
-///
-/// Storage format:
-///   [8 bytes: original data length (u64 LE)]
-///   [8 bytes: shard size (u64 LE)]
-///   For each of (RS_DATA_SHARDS + RS_PARITY_SHARDS) shards:
-///     [4 bytes: CRC32 of shard (u32 LE)]
-///     [shard_size bytes: shard data]
-fn rs_encode(data: &[u8]) -> Vec<u8> {
-    let original_len = data.len();
-    let shard_size = ((original_len + RS_DATA_SHARDS - 1) / RS_DATA_SHARDS).max(1);
-
-    // Build data shards, zero-padding the last one if needed
-    let mut shards: Vec<Vec<u8>> = (0..RS_DATA_SHARDS)
-        .map(|i| {
-            let start = i * shard_size;
-            let end = ((i + 1) * shard_size).min(original_len);
-            let mut shard = if start < original_len {
-                data[start..end].to_vec()
-            } else {
-                Vec::new()
-            };
-            shard.resize(shard_size, 0u8);
-            shard
-        })
-        .collect();
-
-    // Append empty parity shards to be filled by the encoder
-    for _ in 0..RS_PARITY_SHARDS {
-        shards.push(vec![0u8; shard_size]);
-    }
-
-    let rs = ReedSolomon::new(RS_DATA_SHARDS, RS_PARITY_SHARDS)
-        .expect("Invalid RS parameters");
-    rs.encode(&mut shards).expect("RS encode failed");
-
-    // Serialize header + shards with per-shard CRC32
-    let total_shards = RS_DATA_SHARDS + RS_PARITY_SHARDS;
-    let mut out = Vec::with_capacity(16 + total_shards * (4 + shard_size));
-    out.extend_from_slice(&(original_len as u64).to_le_bytes());
-    out.extend_from_slice(&(shard_size as u64).to_le_bytes());
-    for shard in &shards {
-        let crc = crc32fast::hash(shard);
-        out.extend_from_slice(&crc.to_le_bytes());
-        out.extend_from_slice(shard);
-    }
-    out
-}
-
-/// Decode Reed-Solomon encoded blob data, recovering from up to RS_PARITY_SHARDS corrupt shards.
-///
-/// Falls back to returning the raw bytes unchanged if the format is unrecognised (e.g. legacy blobs).
-fn rs_decode(encoded: &[u8]) -> Vec<u8> {
-    if encoded.len() < 16 {
-        return encoded.to_vec();
-    }
-
-    let original_len = u64::from_le_bytes(encoded[..8].try_into().unwrap()) as usize;
-    let shard_size   = u64::from_le_bytes(encoded[8..16].try_into().unwrap()) as usize;
-
-    let total_shards = RS_DATA_SHARDS + RS_PARITY_SHARDS;
-    let expected_len = 16 + total_shards * (4 + shard_size);
-
-    if shard_size == 0 || encoded.len() != expected_len {
-        // Not in RS format — return as-is (handles legacy / empty blobs)
-        return encoded.to_vec();
-    }
-
-    // Parse shards, marking those with bad CRC as missing (None)
-    let mut shards: Vec<Option<Vec<u8>>> = Vec::with_capacity(total_shards);
-    let mut pos = 16usize;
-    for _ in 0..total_shards {
-        let crc_stored = u32::from_le_bytes(encoded[pos..pos + 4].try_into().unwrap());
-        let shard_data = encoded[pos + 4..pos + 4 + shard_size].to_vec();
-        let crc_actual = crc32fast::hash(&shard_data);
-        shards.push(if crc_stored == crc_actual { Some(shard_data) } else { None });
-        pos += 4 + shard_size;
-    }
-
-    let missing = shards.iter().filter(|s| s.is_none()).count();
-    if missing > 0 {
-        let rs = ReedSolomon::new(RS_DATA_SHARDS, RS_PARITY_SHARDS)
-            .expect("Invalid RS parameters");
-        if rs.reconstruct(&mut shards).is_err() {
-            log::warn!("RS reconstruction failed ({} shards missing)", missing);
-        }
-    }
-
-    // Reassemble original data from data shards
-    let mut data = Vec::with_capacity(RS_DATA_SHARDS * shard_size);
-    for shard in shards.into_iter().take(RS_DATA_SHARDS) {
-        match shard {
-            Some(s) => data.extend_from_slice(&s),
-            None    => data.extend_from_slice(&vec![0u8; shard_size]),
-        }
-    }
-    data.truncate(original_len);
-    data
-}
 
 fn now_timespec() -> (i64, u32) {
     let d = SystemTime::now()
@@ -303,7 +200,7 @@ impl NofsFS {
         if raw.is_empty() {
             return raw;
         }
-        rs_decode(&raw)
+        reed_solomon::decode(&raw)
     }
 
     fn write_blob(&self, data: &[u8]) -> String {
@@ -311,7 +208,7 @@ impl NofsFS {
         let path = self.blob_path(&hash);
         if !path.exists() {
             std::fs::create_dir_all(path.parent().unwrap()).ok();
-            let encoded = rs_encode(data);
+            let encoded = reed_solomon::encode(data);
             let tmp = path.with_extension("tmp");
             std::fs::write(&tmp, &encoded).expect("Failed to write blob");
             std::fs::rename(&tmp, &path).expect("Failed to rename blob");
