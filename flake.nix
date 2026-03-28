@@ -18,7 +18,7 @@
         version = "0.1.0";
         src = ./.;
         cargoLock.lockFile = ./Cargo.lock;
-        nativeBuildInputs = [ pkgs.pkg-config ];
+        nativeBuildInputs = [ pkgs.pkg-config pkgs.autoPatchelfHook ];
         buildInputs = [
           pkgs.fuse3
           pkgs.wayland
