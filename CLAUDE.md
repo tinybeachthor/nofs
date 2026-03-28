@@ -82,12 +82,13 @@ FUSE filesystem in Rust with content-addressed blob storage, Polars/AVRO metadat
 - `read_blob(hash)` — reads bytes from blob file
 - `delete_blob_if_unreferenced(hash)` — garbage-collects blob only if no inode references it
 - Blobs are deduplicated: files with identical content share one physical blob
+- `cdc_chunk_and_write(data)` — splits data using FastCDC (v2020) content-defined chunking (min=512KB, avg=1MB, max=2MB), writes each chunk as a blob, returns ordered hash list
 
 ### Open file lifecycle
 
 1. `open()` / `create()` — loads blob into `OpenFile.data: Vec<u8>` buffer in RAM
 2. `read()` / `write()` — operates on in-memory buffer; writes mark `dirty = true`
-3. `flush()` — persists dirty buffer to blob store, updates inode's `blob_hash`
+3. `flush()` — persists dirty buffer to blob store via CDC chunking, updates inode's `blob_hashes`
 4. `release()` — flushes if dirty, removes handle from `open_files`
 
 **Caution:** All open files are fully buffered in RAM. Large files can exhaust memory.
