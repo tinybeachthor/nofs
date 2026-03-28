@@ -16,6 +16,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 const TTL: Duration = Duration::from_secs(1);
 const FUSE_ROOT_INODE: u64 = 1;
 const FLUSH_INTERVAL: Duration = Duration::from_secs(30);
+const CHUNK_SIZE: usize = 1024 * 1024; // 1MB
 
 fn now_timespec() -> (i64, u32) {
     let d = SystemTime::now()
@@ -76,7 +77,7 @@ struct InodeMeta {
     mtime_nsecs: u32,
     ctime_secs: i64,
     ctime_nsecs: u32,
-    blob_hash: Option<String>,
+    blob_hashes: Vec<String>,
     symlink_target: Option<String>,
     rdev: u32,
 }
@@ -209,7 +210,7 @@ impl NofsFS {
         let referenced = self
             .inode_meta
             .values()
-            .any(|m| m.blob_hash.as_deref() == Some(hash));
+            .any(|m| m.blob_hashes.iter().any(|h| h == hash));
         if !referenced {
             std::fs::remove_file(self.blob_path(hash)).ok();
         }
@@ -236,7 +237,7 @@ impl NofsFS {
                     mtime_nsecs: nsecs,
                     ctime_secs: secs,
                     ctime_nsecs: nsecs,
-                    blob_hash: None,
+                    blob_hashes: vec![],
                     symlink_target: None,
                     rdev: 0,
                 },
@@ -265,7 +266,7 @@ impl NofsFS {
         let col_mtime_ns = df.column("mtime_nsecs").unwrap().i32().unwrap();
         let col_ctime_s = df.column("ctime_secs").unwrap().i64().unwrap();
         let col_ctime_ns = df.column("ctime_nsecs").unwrap().i32().unwrap();
-        let col_blob = df.column("blob_hash").unwrap().str().unwrap();
+        let col_blob = df.column("blob_hashes").unwrap().str().unwrap();
         let col_symlink = df.column("symlink_target").unwrap().str().unwrap();
         let col_rdev = df.column("rdev").unwrap().i32().unwrap();
 
@@ -297,7 +298,10 @@ impl NofsFS {
                         mtime_nsecs: col_mtime_ns.get(i).unwrap() as u32,
                         ctime_secs: col_ctime_s.get(i).unwrap(),
                         ctime_nsecs: col_ctime_ns.get(i).unwrap() as u32,
-                        blob_hash: col_blob.get(i).map(|s: &str| s.to_string()),
+                        blob_hashes: col_blob.get(i)
+                            .filter(|s| !s.is_empty())
+                            .map(|s| s.split(',').map(str::to_string).collect())
+                            .unwrap_or_default(),
                         symlink_target: col_symlink.get(i).map(|s: &str| s.to_string()),
                         rdev: col_rdev.get(i).unwrap() as u32,
                     },
@@ -328,7 +332,7 @@ impl NofsFS {
             mtime_nsecs: i32,
             ctime_secs: i64,
             ctime_nsecs: i32,
-            blob_hash: Option<String>,
+            blob_hashes: String,
             symlink_target: Option<String>,
             rdev: i32,
         }
@@ -350,7 +354,7 @@ impl NofsFS {
                 mtime_nsecs: meta.mtime_nsecs as i32,
                 ctime_secs: meta.ctime_secs,
                 ctime_nsecs: meta.ctime_nsecs as i32,
-                blob_hash: meta.blob_hash.clone(),
+                blob_hashes: meta.blob_hashes.join(","),
                 symlink_target: meta.symlink_target.clone(),
                 rdev: meta.rdev as i32,
             }
@@ -385,7 +389,7 @@ impl NofsFS {
         let v_mtime_ns: Vec<i32> = rows.iter().map(|r| r.mtime_nsecs).collect();
         let v_ctime_s: Vec<i64> = rows.iter().map(|r| r.ctime_secs).collect();
         let v_ctime_ns: Vec<i32> = rows.iter().map(|r| r.ctime_nsecs).collect();
-        let v_blob: Vec<Option<&str>> = rows.iter().map(|r| r.blob_hash.as_deref()).collect();
+        let v_blob: Vec<&str> = rows.iter().map(|r| r.blob_hashes.as_str()).collect();
         let v_symlink: Vec<Option<&str>> =
             rows.iter().map(|r| r.symlink_target.as_deref()).collect();
         let v_rdev: Vec<i32> = rows.iter().map(|r| r.rdev).collect();
@@ -406,7 +410,7 @@ impl NofsFS {
             Series::new("mtime_nsecs".into(), &v_mtime_ns).into(),
             Series::new("ctime_secs".into(), &v_ctime_s).into(),
             Series::new("ctime_nsecs".into(), &v_ctime_ns).into(),
-            Series::new("blob_hash".into(), &v_blob).into(),
+            Series::new("blob_hashes".into(), &v_blob).into(),
             Series::new("symlink_target".into(), &v_symlink).into(),
             Series::new("rdev".into(), &v_rdev).into(),
         ])
@@ -432,19 +436,22 @@ impl NofsFS {
             (open_file.inode, open_file.data.clone())
         };
 
-        let old_hash = self
+        let old_hashes = self
             .inode_meta
             .get(&inode)
-            .and_then(|m| m.blob_hash.clone());
+            .map(|m| m.blob_hashes.clone())
+            .unwrap_or_default();
 
-        let new_hash = if data.is_empty() {
-            None
+        let new_hashes: Vec<String> = if data.is_empty() {
+            vec![]
         } else {
-            Some(self.write_blob(&data))
+            data.chunks(CHUNK_SIZE)
+                .map(|chunk| self.write_blob(chunk))
+                .collect()
         };
 
         if let Some(meta) = self.inode_meta.get_mut(&inode) {
-            meta.blob_hash = new_hash;
+            meta.blob_hashes = new_hashes;
             meta.size = data.len() as u64;
             let (secs, nsecs) = now_timespec();
             meta.mtime_secs = secs;
@@ -459,7 +466,7 @@ impl NofsFS {
 
         self.dirty = true;
 
-        if let Some(hash) = old_hash {
+        for hash in old_hashes {
             self.delete_blob_if_unreferenced(&hash);
         }
     }
@@ -574,25 +581,31 @@ impl Filesystem for NofsFS {
                     of.dirty = true;
                 }
             } else {
-                // Load blob, truncate, write back
-                let old_hash = self
+                // Load all chunks, truncate, re-chunk and write back
+                let old_hashes = self
                     .inode_meta
                     .get(&ino)
-                    .and_then(|m| m.blob_hash.clone());
-                let mut data = old_hash
-                    .as_deref()
-                    .map(|h| self.read_blob(h))
+                    .map(|m| m.blob_hashes.clone())
                     .unwrap_or_default();
+                let mut data: Vec<u8> = {
+                    let mut buf = Vec::new();
+                    for hash in &old_hashes {
+                        buf.extend_from_slice(&self.read_blob(hash));
+                    }
+                    buf
+                };
                 data.resize(new_size as usize, 0);
-                let new_hash = if data.is_empty() {
-                    None
+                let new_hashes: Vec<String> = if data.is_empty() {
+                    vec![]
                 } else {
-                    Some(self.write_blob(&data))
+                    data.chunks(CHUNK_SIZE)
+                        .map(|chunk| self.write_blob(chunk))
+                        .collect()
                 };
                 if let Some(meta) = self.inode_meta.get_mut(&ino) {
-                    meta.blob_hash = new_hash;
+                    meta.blob_hashes = new_hashes;
                 }
-                if let Some(hash) = old_hash {
+                for hash in old_hashes {
                     self.delete_blob_if_unreferenced(&hash);
                 }
             }
@@ -721,7 +734,7 @@ impl Filesystem for NofsFS {
                 mtime_nsecs: nsecs,
                 ctime_secs: secs,
                 ctime_nsecs: nsecs,
-                blob_hash: None,
+                blob_hashes: vec![],
                 symlink_target: None,
                 rdev,
             },
@@ -782,7 +795,7 @@ impl Filesystem for NofsFS {
                 mtime_nsecs: nsecs,
                 ctime_secs: secs,
                 ctime_nsecs: nsecs,
-                blob_hash: None,
+                blob_hashes: vec![],
                 symlink_target: None,
                 rdev: 0,
             },
@@ -839,11 +852,12 @@ impl Filesystem for NofsFS {
         };
 
         if should_remove {
-            let old_hash = self
+            let old_hashes = self
                 .inode_meta
                 .remove(&child_ino)
-                .and_then(|m| m.blob_hash);
-            if let Some(hash) = old_hash {
+                .map(|m| m.blob_hashes)
+                .unwrap_or_default();
+            for hash in old_hashes {
                 self.delete_blob_if_unreferenced(&hash);
             }
         }
@@ -928,7 +942,7 @@ impl Filesystem for NofsFS {
                 mtime_nsecs: nsecs,
                 ctime_secs: secs,
                 ctime_nsecs: nsecs,
-                blob_hash: None,
+                blob_hashes: vec![],
                 symlink_target: Some(target_str),
                 rdev: 0,
             },
@@ -980,11 +994,12 @@ impl Filesystem for NofsFS {
             if let Some(meta) = self.inode_meta.get_mut(&replaced_ino) {
                 meta.nlink = meta.nlink.saturating_sub(1);
                 if meta.nlink == 0 {
-                    let old_hash = self
+                    let old_hashes = self
                         .inode_meta
                         .remove(&replaced_ino)
-                        .and_then(|m| m.blob_hash);
-                    if let Some(hash) = old_hash {
+                        .map(|m| m.blob_hashes)
+                        .unwrap_or_default();
+                    for hash in old_hashes {
                         self.delete_blob_if_unreferenced(&hash);
                     }
                 }
@@ -1064,11 +1079,14 @@ impl Filesystem for NofsFS {
         let access_mode = flags & libc::O_ACCMODE;
         let writable = access_mode == libc::O_WRONLY || access_mode == libc::O_RDWR;
 
-        let data = meta
-            .blob_hash
-            .as_deref()
-            .map(|h| self.read_blob(h))
-            .unwrap_or_default();
+        let data = {
+            let hashes = meta.blob_hashes.clone();
+            let mut buf = Vec::with_capacity(meta.size as usize);
+            for hash in &hashes {
+                buf.extend_from_slice(&self.read_blob(hash));
+            }
+            buf
+        };
 
         let fh = self.alloc_fh();
         self.open_files.insert(
@@ -1260,7 +1278,7 @@ impl Filesystem for NofsFS {
                 mtime_nsecs: nsecs,
                 ctime_secs: secs,
                 ctime_nsecs: nsecs,
-                blob_hash: None,
+                blob_hashes: vec![],
                 symlink_target: None,
                 rdev: 0,
             },
