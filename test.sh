@@ -96,5 +96,31 @@ grep -q "appended" "$MOUNT/test.txt" || fail "persistence: test.txt append lost"
 [[ "$(cat "$MOUNT/after.txt")" == "moveme" ]] || fail "persistence: after.txt lost"
 echo "PASS: persistence"
 
+# Test: Reed-Solomon recovery from corrupt blob shards
+echo "rs recovery" > "$MOUNT/rs_test.txt"
+stop_mount
+
+RS_CONTENT="rs recovery"
+RS_HASH=$(printf '%s\n' "$RS_CONTENT" | sha256sum | awk '{print $1}')
+RS_BLOB="$DATA/blobs/${RS_HASH:0:2}/${RS_HASH:2}"
+[[ -f "$RS_BLOB" ]] || fail "RS recovery: blob not found at $RS_BLOB"
+
+python3 - "$RS_BLOB" <<'PYEOF'
+import struct, sys
+data = open(sys.argv[1], 'rb').read()
+_, shard_size = struct.unpack_from('<QQ', data, 0)
+shard_size = int(shard_size)
+result = bytearray(data)
+# Corrupt the first byte of 4 data shards — one more than any single parity shard can cover
+for i in [0, 2, 4, 6]:
+    data_offset = 16 + i * (4 + shard_size) + 4
+    result[data_offset] ^= 0xFF
+open(sys.argv[1], 'wb').write(result)
+PYEOF
+
+start_mount
+[[ "$(cat "$MOUNT/rs_test.txt")" == "rs recovery" ]] || fail "RS recovery: content mismatch after 4 shards corrupted"
+echo "PASS: Reed-Solomon recovery from 4 corrupt shards"
+
 echo ""
 echo "All tests passed."
