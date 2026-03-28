@@ -18,7 +18,7 @@
         version = "0.1.0";
         src = ./.;
         cargoLock.lockFile = ./Cargo.lock;
-        nativeBuildInputs = [ pkgs.pkg-config pkgs.autoPatchelfHook ];
+        nativeBuildInputs = [ pkgs.pkg-config pkgs.makeWrapper ];
         buildInputs = [
           pkgs.fuse3
           pkgs.wayland
@@ -27,6 +27,17 @@
           pkgs.fontconfig
           pkgs.libGL
         ];
+        postInstall = ''
+          wrapProgram $out/bin/nofs \
+            --prefix LD_LIBRARY_PATH : ${pkgs.lib.makeLibraryPath [
+              pkgs.fuse3
+              pkgs.wayland
+              pkgs.libxkbcommon
+              pkgs.xorg.libxcb
+              pkgs.fontconfig
+              pkgs.libGL
+            ]}
+        '';
       };
 
       devShells.x86_64-linux.default = pkgs.mkShell {
