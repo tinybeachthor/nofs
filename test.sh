@@ -32,8 +32,8 @@ stop_mount() {
     NOFS_PID=
 }
 
-# Build
-cargo build --release 2>&1
+# Build (skip if binary already present, e.g. pre-built by nix in CI)
+[[ -x ./target/release/nofs ]] || cargo build --release 2>&1
 
 # First mount
 start_mount

@@ -1,0 +1,46 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # fuse/fuse3 from apt provides suid fusermount/fusermount3 binaries.
+      # Nix cannot set the suid bit on non-NixOS, so the nix-store copy
+      # won't work for non-root users.
+      - name: Install FUSE
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y fuse fuse3
+
+      - name: Enable FUSE device
+        run: |
+          sudo modprobe fuse
+          sudo chmod 666 /dev/fuse
+
+      - uses: DeterminateSystems/nix-installer-action@v14
+
+      # Zero-config GitHub Actions cache for all nix store paths
+      # (fenix Rust toolchain, nixpkgs packages, Cargo vendored deps)
+      - uses: DeterminateSystems/magic-nix-cache-action@v8
+
+      - name: Build binary with Nix
+        run: nix build --no-update-lock-file
+
+      - name: Place binary for tests
+        run: |
+          mkdir -p target/release
+          cp result/bin/nofs target/release/nofs
+
+      - name: Run integration tests
+        run: bash test.sh
