@@ -18,3 +18,5 @@ polars = { version = "0.46", features = ["avro"] }
 sha2 = "0.10"
 hex = "0.4"
 fastcdc = "3.2.1"
+reed-solomon-erasure = "6"
+crc32fast = "1"
