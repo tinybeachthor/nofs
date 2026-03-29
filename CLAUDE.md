@@ -21,7 +21,9 @@ Unit tests for `reed_solomon` run without FUSE and cover round-trips, empty inpu
 ```
 src/
   main.rs          — CLI (clap), thread orchestration, GUI (NofsApp stub)
-  fs.rs            — NofsFS struct implementing fuser::Filesystem (~1300 lines)
+  fs.rs            — NofsFS struct implementing fuser::Filesystem, ChangelogManager, FUSE ops
+  blob.rs          — Blob storage layer: read/write/CDC-chunk blobs (pure functions)
+  store.rs         — Object store layer: TreeEntry/TreeObject/CommitObject structs + read/write fns
   reed_solomon.rs  — Reed-Solomon encode/decode (unit-tested)
 test.sh            — 12 integration tests (mount, assert, unmount)
 flake.nix          — Nix dev environment (Rust + FUSE 3 + GUI libs)
@@ -30,26 +32,44 @@ Cargo.toml         — Dependencies
 
 ## Architecture
 
-FUSE filesystem in Rust with content-addressed blob storage, Polars/AVRO metadata persistence, and an eframe/egui GUI window.
+FUSE filesystem in Rust with content-addressed blob storage, git-inspired immutable object store for history, and an eframe/egui GUI window.
 
 ### Storage model
 
-- Metadata (inodes + directory entries) stored in-memory as `HashMap`s, persisted to `metadata.avro` via Polars DataFrames
+- Metadata (inodes + directory entries) stored in-memory as `HashMap`s, persisted as a chain of **commit objects** (no mutable metadata file)
 - File content stored as SHA-256-addressed blobs under `blobs/<hash[..2]>/<hash[2..]>`
-- AVRO schema is denormalized: one row per directory entry, with full inode metadata joined in. Root inode stored with `parent_inode=0, name=""`
-- Metadata flushes on `destroy()` and periodically (every 30s via `FLUSH_INTERVAL` if `dirty`)
-- Blob writes are atomic: written to `.tmp` file then renamed
+- On each flush, directory state is snapshotted into **tree objects** (one per directory, content-addressed), then a **commit object** is appended that points to the root tree and its parent commit
+- **Blobs are never deleted** — all historical file content is preserved on disk
+- A **write-ahead log** (`okaywal`) under `wal/` records the latest commit hash atomically; on startup the WAL is recovered to find the current commit
+- Blob writes are atomic: written to `.tmp` file then renamed; same for tree/commit objects
+
+### On-disk layout
+
+```
+data_dir/
+  blobs/<aa>/<bbb...>          # Reed-Solomon encoded file content (content-addressed)
+  objects/
+    trees/<aa>/<bbb...>        # TreeObject JSON (content-addressed, one per directory snapshot)
+    commits/<aa>/<bbb...>      # CommitObject JSON (content-addressed, one per flush)
+  wal/                         # okaywal write-ahead log — records latest commit hash
+```
 
 ### Key data structures (`src/fs.rs`)
 
-- `InodeMeta` — inode number, file type, permissions, uid/gid, atime/mtime/ctime, `blob_hash: Option<String>`, `symlink_target: Option<String>`, `nlink: u32`, `rdev: u32`
+- `InodeMeta` — inode number, file type, permissions, uid/gid, atime/mtime/ctime, `blob_hashes: Vec<String>`, `symlink_target: Option<String>`, `nlink: u32`, `rdev: u32`
 - `OpenFile` — per open-file-handle buffer: `inode`, `data: Vec<u8>`, `writable`, `dirty`
+- `TreeEntry` — one child entry in a directory snapshot: all inode metadata + `blob_hashes`, `symlink_target`, `subtree_hash: Option<String>` (set for directories)
+- `TreeObject` — directory inode metadata + sorted `entries: Vec<TreeEntry>`; serialized as JSON, content-addressed by SHA-256
+- `CommitObject` — `parent_hash`, `root_tree_hash`, `timestamp_secs`, `next_inode`, `next_fh`; serialized as JSON, content-addressed
+- `ChangelogManager` — `okaywal::LogManager` impl; stores latest commit hash via `Arc<Mutex<Option<String>>>` shared with `init()` for post-recovery extraction
 - `NofsFS` — main state:
   - `inode_meta: HashMap<u64, InodeMeta>`
   - `dir_entries: HashMap<(u64, String), u64>` — (parent_inode, name) → child_inode
   - `open_files: HashMap<u64, OpenFile>` — keyed by file handle
   - `lookup_cnt: HashMap<u64, u64>` — FUSE reference counts for cache invalidation
-  - `next_inode: u64`, `next_fh: u64` — monotonic counters (persisted in metadata)
+  - `next_inode: u64`, `next_fh: u64` — monotonic counters (persisted in commit objects)
+  - `trees_dir`, `commits_dir`, `wal` — object store paths and WAL handle
+  - `current_commit: Option<String>` — hash of latest commit
   - `dirty: bool`, `last_flush: Instant`
 
 ### Two-thread model (default mode)
@@ -69,7 +89,7 @@ FUSE filesystem in Rust with content-addressed blob storage, Polars/AVRO metadat
 
 | Flag | Purpose |
 |------|---------|
-| `<data_dir>` | Directory for `metadata.avro` + `blobs/` |
+| `<data_dir>` | Directory for `objects/`, `blobs/`, and `wal/` |
 | `<mountpoint>` | Where to mount |
 | `--allow-other` | Allow other users to access the mount |
 | `--no-ui` | Disable GUI (used by tests) |
@@ -83,7 +103,7 @@ FUSE filesystem in Rust with content-addressed blob storage, Polars/AVRO metadat
 - `blob_path(hash)` → `<data_dir>/blobs/<hash[..2]>/<hash[2..]>`
 - `write_blob(data)` — SHA-256 hash, RS-encodes data, atomic write (`.tmp` → rename), returns hash
 - `read_blob(hash)` — reads blob file and RS-decodes, recovering from corruption if possible
-- `delete_blob_if_unreferenced(hash)` — garbage-collects blob only if no inode references it
+- Blobs are **never deleted** — all historical versions of file content are preserved
 - Blobs are deduplicated: files with identical content share one physical blob
 - `cdc_chunk_and_write(data)` — splits data using FastCDC (v2020) content-defined chunking (min=512KB, avg=1MB, max=2MB), writes each chunk as a blob, returns ordered hash list
 
@@ -106,15 +126,17 @@ Each blob is encoded with Reed-Solomon before being written to disk (`reed-solom
 
 **Caution:** All open files are fully buffered in RAM. Large files can exhaust memory.
 
-### Metadata persistence (AVRO)
+### Metadata persistence (git-like object store)
 
-- `load_metadata()` — reads `metadata.avro` on `init()`; bootstraps root inode if file absent
-- `flush_metadata()` — serializes `inode_meta` + `dir_entries` to Polars DataFrame → AvroWriter
-- Called from: `destroy()` (unmount), periodic check in `getattr()` every 30s if dirty
+- `init()` — recovers `okaywal::WriteAheadLog` from `wal/`, extracting the latest commit hash via `ChangelogManager`, then calls `load_metadata()`
+- `load_metadata()` — uses `self.current_commit` (set by WAL recovery) to call `load_from_commit()`; if none, bootstraps fresh root inode
+- `flush_metadata()` → `create_commit()` — builds tree objects bottom-up for all directories, writes a commit object, appends its hash to the WAL; called from `destroy()` and periodically every 30s if dirty
+- `build_tree_for_dir(inode)` — recursively snapshots a directory + all subdirectories into `TreeObject` values stored in `objects/trees/`; returns root tree hash
+- `load_from_commit(hash)` → `load_dir_from_tree()` — reconstructs `inode_meta` and `dir_entries` by walking tree objects from the commit's root tree hash
 
 ### Hardlinks & nlink
 
-`nlink` is tracked per inode. `unlink()` decrements nlink; blob and inode are deleted only when `nlink == 0`.
+`nlink` is tracked per inode. `unlink()` decrements nlink; inode is removed from in-memory state only when `nlink == 0`. Blobs are never deleted from disk.
 
 ### Directory lookup
 
@@ -141,6 +163,6 @@ Pattern: build binary → mount with `--no-ui` → wait up to 5s for mount → r
 
 - Error returns use libc error codes (`ENOENT`, `EIO`, `EINVAL`, `ENOTDIR`, `ENOTEMPTY`, etc.)
 - Timestamps: `now_timespec()` returns `(secs, nsecs)` as `(i64, i32)`; stored as `TimeSpec`
-- File type stored as `u8` in AVRO: `0=regular, 1=dir, 2=symlink, 3=block, 4=char, 5=fifo, 6=socket`
+- File type stored as `u8` in tree objects: `0=regular, 1=dir, 2=symlink, 3=block, 4=char, 5=fifo, 6=socket`
 - `TTL: Duration = 1s` — FUSE entry/attribute cache timeout (aggressive invalidation)
 - `FUSE_ROOT_INODE: u64 = 1`
