@@ -1,4 +1,5 @@
 mod fs;
+mod reed_solomon;
 
 use clap::Parser;
 use eframe::egui;

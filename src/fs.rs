@@ -8,6 +8,8 @@ use polars::io::avro::{AvroReader, AvroWriter};
 use sha2::{Digest, Sha256};
 use fastcdc::v2020::FastCDC;
 
+use crate::reed_solomon;
+
 use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt;
@@ -194,7 +196,11 @@ impl NofsFS {
     }
 
     fn read_blob(&self, hash: &str) -> Vec<u8> {
-        std::fs::read(self.blob_path(hash)).unwrap_or_default()
+        let raw = std::fs::read(self.blob_path(hash)).unwrap_or_default();
+        if raw.is_empty() {
+            return raw;
+        }
+        reed_solomon::decode(&raw)
     }
 
     fn write_blob(&self, data: &[u8]) -> String {
@@ -202,8 +208,9 @@ impl NofsFS {
         let path = self.blob_path(&hash);
         if !path.exists() {
             std::fs::create_dir_all(path.parent().unwrap()).ok();
+            let encoded = reed_solomon::encode(data);
             let tmp = path.with_extension("tmp");
-            std::fs::write(&tmp, data).expect("Failed to write blob");
+            std::fs::write(&tmp, &encoded).expect("Failed to write blob");
             std::fs::rename(&tmp, &path).expect("Failed to rename blob");
         }
         hash

@@ -9,20 +9,23 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ```bash
 nix develop              # enter dev shell (Rust toolchain, FUSE 3, GUI libs)
 cargo build --release    # build
-./test.sh                # run all 11 integration tests (builds automatically)
+cargo test               # run unit tests (reed_solomon module; no FUSE required)
+./test.sh                # run all 12 integration tests (builds automatically)
 ```
 
-Tests mount a real FUSE filesystem with `--no-ui`, run assertions, then clean up. There are no unit tests; all testing is integration-based via `test.sh`.
+`test.sh` mounts a real FUSE filesystem with `--no-ui`, runs assertions, then cleans up.
+Unit tests for `reed_solomon` run without FUSE and cover round-trips, empty input, max corruption (4 shards), parity-only corruption, and legacy passthrough.
 
 ## Project Structure
 
 ```
 src/
-  main.rs    — CLI (clap), thread orchestration, GUI (NofsApp stub)
-  fs.rs      — NofsFS struct implementing fuser::Filesystem (~1300 lines)
-test.sh      — 11 integration tests (mount, assert, unmount)
-flake.nix    — Nix dev environment (Rust + FUSE 3 + GUI libs)
-Cargo.toml   — Dependencies
+  main.rs          — CLI (clap), thread orchestration, GUI (NofsApp stub)
+  fs.rs            — NofsFS struct implementing fuser::Filesystem (~1300 lines)
+  reed_solomon.rs  — Reed-Solomon encode/decode (unit-tested)
+test.sh            — 12 integration tests (mount, assert, unmount)
+flake.nix          — Nix dev environment (Rust + FUSE 3 + GUI libs)
+Cargo.toml         — Dependencies
 ```
 
 ## Architecture
@@ -78,11 +81,21 @@ FUSE filesystem in Rust with content-addressed blob storage, Polars/AVRO metadat
 ### Blob storage
 
 - `blob_path(hash)` → `<data_dir>/blobs/<hash[..2]>/<hash[2..]>`
-- `write_blob(data)` — SHA-256 hash, atomic write (`.tmp` → rename), returns hash
-- `read_blob(hash)` — reads bytes from blob file
+- `write_blob(data)` — SHA-256 hash, RS-encodes data, atomic write (`.tmp` → rename), returns hash
+- `read_blob(hash)` — reads blob file and RS-decodes, recovering from corruption if possible
 - `delete_blob_if_unreferenced(hash)` — garbage-collects blob only if no inode references it
 - Blobs are deduplicated: files with identical content share one physical blob
 - `cdc_chunk_and_write(data)` — splits data using FastCDC (v2020) content-defined chunking (min=512KB, avg=1MB, max=2MB), writes each chunk as a blob, returns ordered hash list
+
+### Reed-Solomon error correction
+
+Each blob is encoded with Reed-Solomon before being written to disk (`reed-solomon-erasure` crate, GF(2⁸)):
+
+- **Parameters:** 10 data shards + 4 parity shards — tolerates up to 4 corrupt shards per blob
+- **On-disk format:** 16-byte header (`original_len u64 LE`, `shard_size u64 LE`) followed by 14 shards, each prefixed with a 4-byte CRC32 checksum
+- **Recovery:** `read_blob` verifies each shard's CRC32; shards that fail are marked missing and reconstructed via RS before the data shards are reassembled
+- The hash stored in inode metadata is always over the original (unencoded) data, so deduplication is unaffected
+- Blobs written without RS encoding (legacy) pass through `rs_decode` unchanged (length mismatch causes fall-through)
 
 ### Open file lifecycle
 
