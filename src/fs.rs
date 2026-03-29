@@ -334,8 +334,24 @@ impl NofsFS {
     }
 
     fn read_latest_commit(&self) -> Option<String> {
-        let content = std::fs::read_to_string(&self.changelog_path).ok()?;
-        content
+        use std::io::{Read, Seek, SeekFrom};
+        // Seek to near the end — each CHANGELOG line is at most a few hundred bytes
+        // (<timestamp> <64-char hash> <message>\n), so 4KB is always more than enough
+        // to contain at least one complete line without reading the whole file.
+        const TAIL: u64 = 4096;
+        let mut file = std::fs::File::open(&self.changelog_path).ok()?;
+        let size = file.seek(SeekFrom::End(0)).ok()?;
+        if size == 0 {
+            return None;
+        }
+        let read_from = size.saturating_sub(TAIL);
+        file.seek(SeekFrom::Start(read_from)).ok()?;
+        let mut buf = vec![0u8; (size - read_from) as usize];
+        file.read_exact(&mut buf).ok()?;
+        // The first bytes may be a partial line if we didn't start at offset 0;
+        // we only care about the last complete line so that's fine.
+        std::str::from_utf8(&buf)
+            .ok()?
             .lines()
             .filter(|l| !l.trim().is_empty())
             .last()
