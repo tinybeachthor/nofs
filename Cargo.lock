@@ -2581,6 +2581,8 @@ dependencies = [
  "log",
  "polars",
  "reed-solomon-erasure",
+ "serde",
+ "serde_json",
  "sha2",
 ]
 

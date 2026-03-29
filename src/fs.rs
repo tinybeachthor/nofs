@@ -4,14 +4,17 @@ use fuser::{
 };
 use libc;
 use polars::prelude::*;
-use polars::io::avro::{AvroReader, AvroWriter};
+use polars::io::avro::AvroReader;
 use sha2::{Digest, Sha256};
 use fastcdc::v2020::FastCDC;
 
 use crate::reed_solomon;
 
+use serde::{Deserialize, Serialize};
+
 use std::collections::HashMap;
 use std::ffi::OsStr;
+use std::io::Write;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -117,10 +120,63 @@ struct OpenFile {
     dirty: bool,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct TreeEntry {
+    name: String,
+    inode: u64,
+    file_type: u8,
+    permissions: u16,
+    uid: u32,
+    gid: u32,
+    size: u64,
+    nlink: u32,
+    rdev: u32,
+    atime_secs: i64,
+    atime_nsecs: u32,
+    mtime_secs: i64,
+    mtime_nsecs: u32,
+    ctime_secs: i64,
+    ctime_nsecs: u32,
+    blob_hashes: Vec<String>,
+    symlink_target: Option<String>,
+    subtree_hash: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct TreeObject {
+    inode: u64,
+    permissions: u16,
+    uid: u32,
+    gid: u32,
+    size: u64,
+    nlink: u32,
+    atime_secs: i64,
+    atime_nsecs: u32,
+    mtime_secs: i64,
+    mtime_nsecs: u32,
+    ctime_secs: i64,
+    ctime_nsecs: u32,
+    entries: Vec<TreeEntry>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct CommitObject {
+    parent_hash: Option<String>,
+    root_tree_hash: String,
+    timestamp_secs: i64,
+    next_inode: u64,
+    next_fh: u64,
+    message: String,
+}
+
 pub struct NofsFS {
     data_dir: PathBuf,
     blob_dir: PathBuf,
-    metadata_path: PathBuf,
+    trees_dir: PathBuf,
+    commits_dir: PathBuf,
+    changelog_path: PathBuf,
+
+    current_commit: Option<String>,
 
     inode_meta: HashMap<u64, InodeMeta>,
     dir_entries: HashMap<(u64, String), u64>,
@@ -136,11 +192,17 @@ pub struct NofsFS {
 impl NofsFS {
     pub fn new(data_dir: PathBuf) -> Self {
         let blob_dir = data_dir.join("blobs");
-        let metadata_path = data_dir.join("metadata.avro");
+        let objects_dir = data_dir.join("objects");
+        let trees_dir = objects_dir.join("trees");
+        let commits_dir = objects_dir.join("commits");
+        let changelog_path = data_dir.join("CHANGELOG");
         NofsFS {
             data_dir,
             blob_dir,
-            metadata_path,
+            trees_dir,
+            commits_dir,
+            changelog_path,
+            current_commit: None,
             inode_meta: HashMap::new(),
             dir_entries: HashMap::new(),
             next_inode: 2,
@@ -225,47 +287,256 @@ impl NofsFS {
             .collect()
     }
 
-    fn delete_blob_if_unreferenced(&self, hash: &str) {
-        let referenced = self
-            .inode_meta
-            .values()
-            .any(|m| m.blob_hashes.iter().any(|h| h == hash));
-        if !referenced {
-            std::fs::remove_file(self.blob_path(hash)).ok();
+    // --- Object store (trees + commits) ---
+
+    fn tree_path(&self, hash: &str) -> PathBuf {
+        self.trees_dir.join(&hash[..2]).join(&hash[2..])
+    }
+
+    fn commit_path(&self, hash: &str) -> PathBuf {
+        self.commits_dir.join(&hash[..2]).join(&hash[2..])
+    }
+
+    fn write_tree_object(&self, tree: &TreeObject) -> String {
+        let json = serde_json::to_vec(tree).expect("serialize tree");
+        let hash = hex::encode(Sha256::digest(&json));
+        let path = self.tree_path(&hash);
+        if !path.exists() {
+            std::fs::create_dir_all(path.parent().unwrap()).ok();
+            let tmp = path.with_extension("tmp");
+            std::fs::write(&tmp, &json).expect("write tree");
+            std::fs::rename(&tmp, &path).expect("rename tree");
         }
+        hash
+    }
+
+    fn read_tree_object(&self, hash: &str) -> TreeObject {
+        let json = std::fs::read(self.tree_path(hash)).expect("read tree");
+        serde_json::from_slice(&json).expect("deserialize tree")
+    }
+
+    fn write_commit_object(&self, commit: &CommitObject) -> String {
+        let json = serde_json::to_vec(commit).expect("serialize commit");
+        let hash = hex::encode(Sha256::digest(&json));
+        let path = self.commit_path(&hash);
+        if !path.exists() {
+            std::fs::create_dir_all(path.parent().unwrap()).ok();
+            let tmp = path.with_extension("tmp");
+            std::fs::write(&tmp, &json).expect("write commit");
+            std::fs::rename(&tmp, &path).expect("rename commit");
+        }
+        hash
+    }
+
+    fn read_commit_object(&self, hash: &str) -> CommitObject {
+        let json = std::fs::read(self.commit_path(hash)).expect("read commit");
+        serde_json::from_slice(&json).expect("deserialize commit")
+    }
+
+    fn read_latest_commit(&self) -> Option<String> {
+        let content = std::fs::read_to_string(&self.changelog_path).ok()?;
+        content
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .last()
+            .and_then(|line| line.split_whitespace().nth(1))
+            .map(str::to_string)
+    }
+
+    fn append_changelog(&self, commit_hash: &str, message: &str) {
+        let (ts, _) = now_timespec();
+        let line = format!("{} {} {}\n", ts, commit_hash, message);
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.changelog_path)
+            .expect("open CHANGELOG");
+        f.write_all(line.as_bytes()).expect("write CHANGELOG");
+    }
+
+    fn build_tree_for_dir(&self, dir_inode: u64) -> String {
+        let dir_meta = self.inode_meta.get(&dir_inode).unwrap().clone();
+
+        let mut entries: Vec<TreeEntry> = self
+            .dir_entries
+            .iter()
+            .filter(|((parent, _), _)| *parent == dir_inode)
+            .map(|((_, name), &child_inode)| {
+                let child_meta = self.inode_meta.get(&child_inode).unwrap();
+                let subtree_hash = if child_meta.file_type == FileType::Directory {
+                    Some(self.build_tree_for_dir(child_inode))
+                } else {
+                    None
+                };
+                TreeEntry {
+                    name: name.clone(),
+                    inode: child_inode,
+                    file_type: file_type_to_u8(child_meta.file_type),
+                    permissions: child_meta.permissions,
+                    uid: child_meta.uid,
+                    gid: child_meta.gid,
+                    size: child_meta.size,
+                    nlink: child_meta.nlink,
+                    rdev: child_meta.rdev,
+                    atime_secs: child_meta.atime_secs,
+                    atime_nsecs: child_meta.atime_nsecs,
+                    mtime_secs: child_meta.mtime_secs,
+                    mtime_nsecs: child_meta.mtime_nsecs,
+                    ctime_secs: child_meta.ctime_secs,
+                    ctime_nsecs: child_meta.ctime_nsecs,
+                    blob_hashes: child_meta.blob_hashes.clone(),
+                    symlink_target: child_meta.symlink_target.clone(),
+                    subtree_hash,
+                }
+            })
+            .collect();
+
+        entries.sort_by(|a, b| a.name.cmp(&b.name));
+
+        let tree = TreeObject {
+            inode: dir_meta.inode,
+            permissions: dir_meta.permissions,
+            uid: dir_meta.uid,
+            gid: dir_meta.gid,
+            size: dir_meta.size,
+            nlink: dir_meta.nlink,
+            atime_secs: dir_meta.atime_secs,
+            atime_nsecs: dir_meta.atime_nsecs,
+            mtime_secs: dir_meta.mtime_secs,
+            mtime_nsecs: dir_meta.mtime_nsecs,
+            ctime_secs: dir_meta.ctime_secs,
+            ctime_nsecs: dir_meta.ctime_nsecs,
+            entries,
+        };
+
+        self.write_tree_object(&tree)
+    }
+
+    fn create_commit(&mut self, message: &str) {
+        let root_tree_hash = self.build_tree_for_dir(FUSE_ROOT_INODE);
+        let (ts, _) = now_timespec();
+        let commit = CommitObject {
+            parent_hash: self.current_commit.clone(),
+            root_tree_hash,
+            timestamp_secs: ts,
+            next_inode: self.next_inode,
+            next_fh: self.next_fh,
+            message: message.to_string(),
+        };
+        let commit_hash = self.write_commit_object(&commit);
+        self.append_changelog(&commit_hash, message);
+        self.current_commit = Some(commit_hash);
+    }
+
+    fn load_dir_from_tree(&mut self, parent_inode: u64, tree_hash: &str) {
+        let tree = self.read_tree_object(tree_hash);
+
+        self.inode_meta.insert(
+            tree.inode,
+            InodeMeta {
+                inode: tree.inode,
+                file_type: FileType::Directory,
+                permissions: tree.permissions,
+                uid: tree.uid,
+                gid: tree.gid,
+                size: tree.size,
+                nlink: tree.nlink,
+                rdev: 0,
+                atime_secs: tree.atime_secs,
+                atime_nsecs: tree.atime_nsecs,
+                mtime_secs: tree.mtime_secs,
+                mtime_nsecs: tree.mtime_nsecs,
+                ctime_secs: tree.ctime_secs,
+                ctime_nsecs: tree.ctime_nsecs,
+                blob_hashes: vec![],
+                symlink_target: None,
+            },
+        );
+
+        for entry in &tree.entries {
+            self.dir_entries
+                .insert((parent_inode, entry.name.clone()), entry.inode);
+            self.inode_meta.insert(
+                entry.inode,
+                InodeMeta {
+                    inode: entry.inode,
+                    file_type: u8_to_file_type(entry.file_type),
+                    permissions: entry.permissions,
+                    uid: entry.uid,
+                    gid: entry.gid,
+                    size: entry.size,
+                    nlink: entry.nlink,
+                    rdev: entry.rdev,
+                    atime_secs: entry.atime_secs,
+                    atime_nsecs: entry.atime_nsecs,
+                    mtime_secs: entry.mtime_secs,
+                    mtime_nsecs: entry.mtime_nsecs,
+                    ctime_secs: entry.ctime_secs,
+                    ctime_nsecs: entry.ctime_nsecs,
+                    blob_hashes: entry.blob_hashes.clone(),
+                    symlink_target: entry.symlink_target.clone(),
+                },
+            );
+
+            if let Some(subtree_hash) = &entry.subtree_hash {
+                self.load_dir_from_tree(entry.inode, subtree_hash);
+            }
+        }
+    }
+
+    fn load_from_commit(&mut self, commit_hash: &str) {
+        let commit = self.read_commit_object(commit_hash);
+        self.next_inode = commit.next_inode;
+        self.next_fh = commit.next_fh;
+        self.current_commit = Some(commit_hash.to_string());
+        self.load_dir_from_tree(FUSE_ROOT_INODE, &commit.root_tree_hash);
     }
 
     // --- Metadata serialization ---
 
     fn load_metadata(&mut self) {
-        if !self.metadata_path.exists() {
-            let (secs, nsecs) = now_timespec();
-            self.inode_meta.insert(
-                FUSE_ROOT_INODE,
-                InodeMeta {
-                    inode: FUSE_ROOT_INODE,
-                    file_type: FileType::Directory,
-                    permissions: 0o755,
-                    uid: unsafe { libc::getuid() },
-                    gid: unsafe { libc::getgid() },
-                    size: 0,
-                    nlink: 2,
-                    atime_secs: secs,
-                    atime_nsecs: nsecs,
-                    mtime_secs: secs,
-                    mtime_nsecs: nsecs,
-                    ctime_secs: secs,
-                    ctime_nsecs: nsecs,
-                    blob_hashes: vec![],
-                    symlink_target: None,
-                    rdev: 0,
-                },
-            );
-            self.next_inode = 2;
+        // Always load the latest commit (last CHANGELOG entry)
+        if let Some(commit_hash) = self.read_latest_commit() {
+            self.load_from_commit(&commit_hash);
             return;
         }
 
-        let file = std::fs::File::open(&self.metadata_path).expect("Failed to open metadata");
+        // Backward compatibility: migrate from metadata.avro if present
+        let legacy_path = self.data_dir.join("metadata.avro");
+        if legacy_path.exists() {
+            self.load_metadata_avro(&legacy_path);
+            self.create_commit("migrate from metadata.avro");
+            return;
+        }
+
+        // Fresh filesystem: bootstrap root inode
+        let (secs, nsecs) = now_timespec();
+        self.inode_meta.insert(
+            FUSE_ROOT_INODE,
+            InodeMeta {
+                inode: FUSE_ROOT_INODE,
+                file_type: FileType::Directory,
+                permissions: 0o755,
+                uid: unsafe { libc::getuid() },
+                gid: unsafe { libc::getgid() },
+                size: 0,
+                nlink: 2,
+                atime_secs: secs,
+                atime_nsecs: nsecs,
+                mtime_secs: secs,
+                mtime_nsecs: nsecs,
+                ctime_secs: secs,
+                ctime_nsecs: nsecs,
+                blob_hashes: vec![],
+                symlink_target: None,
+                rdev: 0,
+            },
+        );
+        self.next_inode = 2;
+    }
+
+    fn load_metadata_avro(&mut self, path: &std::path::Path) {
+        let file = std::fs::File::open(path).expect("Failed to open metadata");
         let df = AvroReader::new(file)
             .finish()
             .expect("Failed to read AVRO");
@@ -317,7 +588,8 @@ impl NofsFS {
                         mtime_nsecs: col_mtime_ns.get(i).unwrap() as u32,
                         ctime_secs: col_ctime_s.get(i).unwrap(),
                         ctime_nsecs: col_ctime_ns.get(i).unwrap() as u32,
-                        blob_hashes: col_blob.get(i)
+                        blob_hashes: col_blob
+                            .get(i)
                             .filter(|s| !s.is_empty())
                             .map(|s| s.split(',').map(str::to_string).collect())
                             .unwrap_or_default(),
@@ -333,116 +605,10 @@ impl NofsFS {
         self.next_inode = max_inode + 1;
     }
 
-    fn flush_metadata(&self) {
-        // Collect rows: root inode + all dir entries
-        struct Row {
-            inode: i64,
-            parent_inode: i64,
-            name: String,
-            file_type: i32,
-            permissions: i32,
-            uid: i32,
-            gid: i32,
-            size: i64,
-            nlink: i32,
-            atime_secs: i64,
-            atime_nsecs: i32,
-            mtime_secs: i64,
-            mtime_nsecs: i32,
-            ctime_secs: i64,
-            ctime_nsecs: i32,
-            blob_hashes: String,
-            symlink_target: Option<String>,
-            rdev: i32,
-        }
-
-        fn meta_to_row(meta: &InodeMeta, parent: u64, name: String) -> Row {
-            Row {
-                inode: meta.inode as i64,
-                parent_inode: parent as i64,
-                name,
-                file_type: file_type_to_u8(meta.file_type) as i32,
-                permissions: meta.permissions as i32,
-                uid: meta.uid as i32,
-                gid: meta.gid as i32,
-                size: meta.size as i64,
-                nlink: meta.nlink as i32,
-                atime_secs: meta.atime_secs,
-                atime_nsecs: meta.atime_nsecs as i32,
-                mtime_secs: meta.mtime_secs,
-                mtime_nsecs: meta.mtime_nsecs as i32,
-                ctime_secs: meta.ctime_secs,
-                ctime_nsecs: meta.ctime_nsecs as i32,
-                blob_hashes: meta.blob_hashes.join(","),
-                symlink_target: meta.symlink_target.clone(),
-                rdev: meta.rdev as i32,
-            }
-        }
-
-        let mut rows: Vec<Row> = Vec::new();
-
-        // Root inode row (parent=0, name="")
-        if let Some(meta) = self.inode_meta.get(&FUSE_ROOT_INODE) {
-            rows.push(meta_to_row(meta, 0, String::new()));
-        }
-
-        // One row per dir entry
-        for ((parent, name), &child_inode) in &self.dir_entries {
-            if let Some(meta) = self.inode_meta.get(&child_inode) {
-                rows.push(meta_to_row(meta, *parent, name.clone()));
-            }
-        }
-
-        let v_inode: Vec<i64> = rows.iter().map(|r| r.inode).collect();
-        let v_parent: Vec<i64> = rows.iter().map(|r| r.parent_inode).collect();
-        let v_name: Vec<&str> = rows.iter().map(|r| r.name.as_str()).collect();
-        let v_ft: Vec<i32> = rows.iter().map(|r| r.file_type).collect();
-        let v_perm: Vec<i32> = rows.iter().map(|r| r.permissions).collect();
-        let v_uid: Vec<i32> = rows.iter().map(|r| r.uid).collect();
-        let v_gid: Vec<i32> = rows.iter().map(|r| r.gid).collect();
-        let v_size: Vec<i64> = rows.iter().map(|r| r.size).collect();
-        let v_nlink: Vec<i32> = rows.iter().map(|r| r.nlink).collect();
-        let v_atime_s: Vec<i64> = rows.iter().map(|r| r.atime_secs).collect();
-        let v_atime_ns: Vec<i32> = rows.iter().map(|r| r.atime_nsecs).collect();
-        let v_mtime_s: Vec<i64> = rows.iter().map(|r| r.mtime_secs).collect();
-        let v_mtime_ns: Vec<i32> = rows.iter().map(|r| r.mtime_nsecs).collect();
-        let v_ctime_s: Vec<i64> = rows.iter().map(|r| r.ctime_secs).collect();
-        let v_ctime_ns: Vec<i32> = rows.iter().map(|r| r.ctime_nsecs).collect();
-        let v_blob: Vec<&str> = rows.iter().map(|r| r.blob_hashes.as_str()).collect();
-        let v_symlink: Vec<Option<&str>> =
-            rows.iter().map(|r| r.symlink_target.as_deref()).collect();
-        let v_rdev: Vec<i32> = rows.iter().map(|r| r.rdev).collect();
-
-        let mut df = DataFrame::new(vec![
-            Series::new("inode".into(), &v_inode).into(),
-            Series::new("parent_inode".into(), &v_parent).into(),
-            Series::new("name".into(), &v_name).into(),
-            Series::new("file_type".into(), &v_ft).into(),
-            Series::new("permissions".into(), &v_perm).into(),
-            Series::new("uid".into(), &v_uid).into(),
-            Series::new("gid".into(), &v_gid).into(),
-            Series::new("size".into(), &v_size).into(),
-            Series::new("nlink".into(), &v_nlink).into(),
-            Series::new("atime_secs".into(), &v_atime_s).into(),
-            Series::new("atime_nsecs".into(), &v_atime_ns).into(),
-            Series::new("mtime_secs".into(), &v_mtime_s).into(),
-            Series::new("mtime_nsecs".into(), &v_mtime_ns).into(),
-            Series::new("ctime_secs".into(), &v_ctime_s).into(),
-            Series::new("ctime_nsecs".into(), &v_ctime_ns).into(),
-            Series::new("blob_hashes".into(), &v_blob).into(),
-            Series::new("symlink_target".into(), &v_symlink).into(),
-            Series::new("rdev".into(), &v_rdev).into(),
-        ])
-        .expect("Failed to create DataFrame");
-
-        let tmp_path = self.metadata_path.with_extension("avro.tmp");
-        let mut file =
-            std::fs::File::create(&tmp_path).expect("Failed to create temp metadata file");
-        AvroWriter::new(&mut file)
-            .finish(&mut df)
-            .expect("Failed to write AVRO");
-        std::fs::rename(&tmp_path, &self.metadata_path).expect("Failed to rename metadata file");
+    fn flush_metadata(&mut self) {
+        self.create_commit("periodic flush");
     }
+
 
     // --- Open file helpers ---
 
@@ -454,12 +620,6 @@ impl NofsFS {
             };
             (open_file.inode, open_file.data.clone())
         };
-
-        let old_hashes = self
-            .inode_meta
-            .get(&inode)
-            .map(|m| m.blob_hashes.clone())
-            .unwrap_or_default();
 
         let new_hashes = self.cdc_chunk_and_write(&data);
 
@@ -478,10 +638,6 @@ impl NofsFS {
         }
 
         self.dirty = true;
-
-        for hash in old_hashes {
-            self.delete_blob_if_unreferenced(&hash);
-        }
     }
 }
 
@@ -492,6 +648,8 @@ impl Filesystem for NofsFS {
         _config: &mut KernelConfig,
     ) -> Result<(), libc::c_int> {
         std::fs::create_dir_all(&self.blob_dir).map_err(|_| libc::EIO)?;
+        std::fs::create_dir_all(&self.trees_dir).map_err(|_| libc::EIO)?;
+        std::fs::create_dir_all(&self.commits_dir).map_err(|_| libc::EIO)?;
         self.load_metadata();
         Ok(())
     }
@@ -611,9 +769,6 @@ impl Filesystem for NofsFS {
                 let new_hashes = self.cdc_chunk_and_write(&data);
                 if let Some(meta) = self.inode_meta.get_mut(&ino) {
                     meta.blob_hashes = new_hashes;
-                }
-                for hash in old_hashes {
-                    self.delete_blob_if_unreferenced(&hash);
                 }
             }
 
@@ -859,14 +1014,7 @@ impl Filesystem for NofsFS {
         };
 
         if should_remove {
-            let old_hashes = self
-                .inode_meta
-                .remove(&child_ino)
-                .map(|m| m.blob_hashes)
-                .unwrap_or_default();
-            for hash in old_hashes {
-                self.delete_blob_if_unreferenced(&hash);
-            }
+            self.inode_meta.remove(&child_ino);
         }
 
         self.mark_dirty();
@@ -1001,14 +1149,7 @@ impl Filesystem for NofsFS {
             if let Some(meta) = self.inode_meta.get_mut(&replaced_ino) {
                 meta.nlink = meta.nlink.saturating_sub(1);
                 if meta.nlink == 0 {
-                    let old_hashes = self
-                        .inode_meta
-                        .remove(&replaced_ino)
-                        .map(|m| m.blob_hashes)
-                        .unwrap_or_default();
-                    for hash in old_hashes {
-                        self.delete_blob_if_unreferenced(&hash);
-                    }
+                    self.inode_meta.remove(&replaced_ino);
                 }
             }
         }
