@@ -1,5 +1,7 @@
+mod blob;
 mod fs;
 mod reed_solomon;
+mod store;
 
 use clap::Parser;
 use eframe::egui;

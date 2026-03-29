@@ -21,7 +21,9 @@ Unit tests for `reed_solomon` run without FUSE and cover round-trips, empty inpu
 ```
 src/
   main.rs          — CLI (clap), thread orchestration, GUI (NofsApp stub)
-  fs.rs            — NofsFS struct implementing fuser::Filesystem (~1300 lines)
+  fs.rs            — NofsFS struct implementing fuser::Filesystem, ChangelogManager, FUSE ops
+  blob.rs          — Blob storage layer: read/write/CDC-chunk blobs (pure functions)
+  store.rs         — Object store layer: TreeEntry/TreeObject/CommitObject structs + read/write fns
   reed_solomon.rs  — Reed-Solomon encode/decode (unit-tested)
 test.sh            — 12 integration tests (mount, assert, unmount)
 flake.nix          — Nix dev environment (Rust + FUSE 3 + GUI libs)

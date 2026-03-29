@@ -3,12 +3,9 @@ use fuser::{
     ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite, Request, TimeOrNow,
 };
 use libc;
-use sha2::{Digest, Sha256};
-use fastcdc::v2020::FastCDC;
 
-use crate::reed_solomon;
-
-use serde::{Deserialize, Serialize};
+use crate::{blob, store};
+use store::{CommitObject, TreeEntry, TreeObject};
 
 use std::collections::HashMap;
 use std::ffi::OsStr;
@@ -19,9 +16,6 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 const TTL: Duration = Duration::from_secs(1);
 const FUSE_ROOT_INODE: u64 = 1;
 const FLUSH_INTERVAL: Duration = Duration::from_secs(30);
-const CDC_MIN_SIZE: u32 = 512 * 1024;      // 512 KB
-const CDC_AVG_SIZE: u32 = 1024 * 1024;     // 1 MB
-const CDC_MAX_SIZE: u32 = 2 * 1024 * 1024; // 2 MB
 
 fn now_timespec() -> (i64, u32) {
     let d = SystemTime::now()
@@ -115,54 +109,6 @@ struct OpenFile {
     data: Vec<u8>,
     writable: bool,
     dirty: bool,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-struct TreeEntry {
-    name: String,
-    inode: u64,
-    file_type: u8,
-    permissions: u16,
-    uid: u32,
-    gid: u32,
-    size: u64,
-    nlink: u32,
-    rdev: u32,
-    atime_secs: i64,
-    atime_nsecs: u32,
-    mtime_secs: i64,
-    mtime_nsecs: u32,
-    ctime_secs: i64,
-    ctime_nsecs: u32,
-    blob_hashes: Vec<String>,
-    symlink_target: Option<String>,
-    subtree_hash: Option<String>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-struct TreeObject {
-    inode: u64,
-    permissions: u16,
-    uid: u32,
-    gid: u32,
-    size: u64,
-    nlink: u32,
-    atime_secs: i64,
-    atime_nsecs: u32,
-    mtime_secs: i64,
-    mtime_nsecs: u32,
-    ctime_secs: i64,
-    ctime_nsecs: u32,
-    entries: Vec<TreeEntry>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-struct CommitObject {
-    parent_hash: Option<String>,
-    root_tree_hash: String,
-    timestamp_secs: i64,
-    next_inode: u64,
-    next_fh: u64,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -277,88 +223,6 @@ impl NofsFS {
         }
     }
 
-    // --- Blob helpers ---
-
-    fn blob_path(&self, hash: &str) -> PathBuf {
-        self.blob_dir.join(&hash[..2]).join(&hash[2..])
-    }
-
-    fn read_blob(&self, hash: &str) -> Vec<u8> {
-        let raw = std::fs::read(self.blob_path(hash)).unwrap_or_default();
-        if raw.is_empty() {
-            return raw;
-        }
-        reed_solomon::decode(&raw)
-    }
-
-    fn write_blob(&self, data: &[u8]) -> String {
-        let hash = hex::encode(Sha256::digest(data));
-        let path = self.blob_path(&hash);
-        if !path.exists() {
-            std::fs::create_dir_all(path.parent().unwrap()).ok();
-            let encoded = reed_solomon::encode(data);
-            let tmp = path.with_extension("tmp");
-            std::fs::write(&tmp, &encoded).expect("Failed to write blob");
-            std::fs::rename(&tmp, &path).expect("Failed to rename blob");
-        }
-        hash
-    }
-
-    fn cdc_chunk_and_write(&self, data: &[u8]) -> Vec<String> {
-        if data.is_empty() {
-            return vec![];
-        }
-        FastCDC::new(data, CDC_MIN_SIZE, CDC_AVG_SIZE, CDC_MAX_SIZE)
-            .map(|chunk| self.write_blob(&data[chunk.offset..chunk.offset + chunk.length]))
-            .collect()
-    }
-
-    // --- Object store (trees + commits) ---
-
-    fn tree_path(&self, hash: &str) -> PathBuf {
-        self.trees_dir.join(&hash[..2]).join(&hash[2..])
-    }
-
-    fn commit_path(&self, hash: &str) -> PathBuf {
-        self.commits_dir.join(&hash[..2]).join(&hash[2..])
-    }
-
-    fn write_tree_object(&self, tree: &TreeObject) -> String {
-        let json = serde_json::to_vec(tree).expect("serialize tree");
-        let hash = hex::encode(Sha256::digest(&json));
-        let path = self.tree_path(&hash);
-        if !path.exists() {
-            std::fs::create_dir_all(path.parent().unwrap()).ok();
-            let tmp = path.with_extension("tmp");
-            std::fs::write(&tmp, &json).expect("write tree");
-            std::fs::rename(&tmp, &path).expect("rename tree");
-        }
-        hash
-    }
-
-    fn read_tree_object(&self, hash: &str) -> TreeObject {
-        let json = std::fs::read(self.tree_path(hash)).expect("read tree");
-        serde_json::from_slice(&json).expect("deserialize tree")
-    }
-
-    fn write_commit_object(&self, commit: &CommitObject) -> String {
-        let json = serde_json::to_vec(commit).expect("serialize commit");
-        let hash = hex::encode(Sha256::digest(&json));
-        let path = self.commit_path(&hash);
-        if !path.exists() {
-            std::fs::create_dir_all(path.parent().unwrap()).ok();
-            let tmp = path.with_extension("tmp");
-            std::fs::write(&tmp, &json).expect("write commit");
-            std::fs::rename(&tmp, &path).expect("rename commit");
-        }
-        hash
-    }
-
-    fn read_commit_object(&self, hash: &str) -> CommitObject {
-        let json = std::fs::read(self.commit_path(hash)).expect("read commit");
-        serde_json::from_slice(&json).expect("deserialize commit")
-    }
-
     fn write_wal_entry(&mut self, commit_hash: &str) {
         let wal = self.wal.as_mut().expect("WAL not initialized");
         let mut entry = wal.begin_entry().expect("begin WAL entry");
@@ -421,7 +285,7 @@ impl NofsFS {
             entries,
         };
 
-        self.write_tree_object(&tree)
+        store::write_tree_object(&self.trees_dir, &tree)
     }
 
     fn create_commit(&mut self) {
@@ -434,13 +298,13 @@ impl NofsFS {
             next_inode: self.next_inode,
             next_fh: self.next_fh,
         };
-        let commit_hash = self.write_commit_object(&commit);
+        let commit_hash = store::write_commit_object(&self.commits_dir, &commit);
         self.write_wal_entry(&commit_hash);
         self.current_commit = Some(commit_hash);
     }
 
     fn load_dir_from_tree(&mut self, parent_inode: u64, tree_hash: &str) {
-        let tree = self.read_tree_object(tree_hash);
+        let tree = store::read_tree_object(&self.trees_dir, tree_hash);
 
         self.inode_meta.insert(
             tree.inode,
@@ -496,7 +360,7 @@ impl NofsFS {
     }
 
     fn load_from_commit(&mut self, commit_hash: &str) {
-        let commit = self.read_commit_object(commit_hash);
+        let commit = store::read_commit_object(&self.commits_dir, commit_hash);
         self.next_inode = commit.next_inode;
         self.next_fh = commit.next_fh;
         self.current_commit = Some(commit_hash.to_string());
@@ -553,7 +417,7 @@ impl NofsFS {
             (open_file.inode, open_file.data.clone())
         };
 
-        let new_hashes = self.cdc_chunk_and_write(&data);
+        let new_hashes = blob::cdc_chunk_and_write(&self.blob_dir, &data);
 
         if let Some(meta) = self.inode_meta.get_mut(&inode) {
             meta.blob_hashes = new_hashes;
@@ -701,12 +565,12 @@ impl Filesystem for NofsFS {
                 let mut data: Vec<u8> = {
                     let mut buf = Vec::new();
                     for hash in &old_hashes {
-                        buf.extend_from_slice(&self.read_blob(hash));
+                        buf.extend_from_slice(&blob::read_blob(&self.blob_dir, hash));
                     }
                     buf
                 };
                 data.resize(new_size as usize, 0);
-                let new_hashes = self.cdc_chunk_and_write(&data);
+                let new_hashes = blob::cdc_chunk_and_write(&self.blob_dir, &data);
                 if let Some(meta) = self.inode_meta.get_mut(&ino) {
                     meta.blob_hashes = new_hashes;
                 }
@@ -1171,7 +1035,7 @@ impl Filesystem for NofsFS {
             let hashes = meta.blob_hashes.clone();
             let mut buf = Vec::with_capacity(meta.size as usize);
             for hash in &hashes {
-                buf.extend_from_slice(&self.read_blob(hash));
+                buf.extend_from_slice(&blob::read_blob(&self.blob_dir, hash));
             }
             buf
         };
