@@ -38,7 +38,7 @@ FUSE filesystem in Rust with content-addressed blob storage, git-inspired immuta
 - File content stored as SHA-256-addressed blobs under `blobs/<hash[..2]>/<hash[2..]>`
 - On each flush, directory state is snapshotted into **tree objects** (one per directory, content-addressed), then a **commit object** is appended that points to the root tree and its parent commit
 - **Blobs are never deleted** — all historical file content is preserved on disk
-- `CHANGELOG` is an append-only log (one line per commit: `<unix_ts> <commit_hash> <message>`); on startup the last line is read to find the current commit
+- A **write-ahead log** (`okaywal`) under `wal/` records the latest commit hash atomically; on startup the WAL is recovered to find the current commit
 - Blob writes are atomic: written to `.tmp` file then renamed; same for tree/commit objects
 
 ### On-disk layout
@@ -49,7 +49,7 @@ data_dir/
   objects/
     trees/<aa>/<bbb...>        # TreeObject JSON (content-addressed, one per directory snapshot)
     commits/<aa>/<bbb...>      # CommitObject JSON (content-addressed, one per flush)
-  CHANGELOG                    # append-only: "<unix_ts> <commit_hash> <message>\n" per line
+  wal/                         # okaywal write-ahead log — records latest commit hash
 ```
 
 ### Key data structures (`src/fs.rs`)
@@ -58,14 +58,15 @@ data_dir/
 - `OpenFile` — per open-file-handle buffer: `inode`, `data: Vec<u8>`, `writable`, `dirty`
 - `TreeEntry` — one child entry in a directory snapshot: all inode metadata + `blob_hashes`, `symlink_target`, `subtree_hash: Option<String>` (set for directories)
 - `TreeObject` — directory inode metadata + sorted `entries: Vec<TreeEntry>`; serialized as JSON, content-addressed by SHA-256
-- `CommitObject` — `parent_hash`, `root_tree_hash`, `timestamp_secs`, `next_inode`, `next_fh`, `message`; serialized as JSON, content-addressed
+- `CommitObject` — `parent_hash`, `root_tree_hash`, `timestamp_secs`, `next_inode`, `next_fh`; serialized as JSON, content-addressed
+- `ChangelogManager` — `okaywal::LogManager` impl; stores latest commit hash via `Arc<Mutex<Option<String>>>` shared with `init()` for post-recovery extraction
 - `NofsFS` — main state:
   - `inode_meta: HashMap<u64, InodeMeta>`
   - `dir_entries: HashMap<(u64, String), u64>` — (parent_inode, name) → child_inode
   - `open_files: HashMap<u64, OpenFile>` — keyed by file handle
   - `lookup_cnt: HashMap<u64, u64>` — FUSE reference counts for cache invalidation
   - `next_inode: u64`, `next_fh: u64` — monotonic counters (persisted in commit objects)
-  - `trees_dir`, `commits_dir`, `changelog_path` — object store paths
+  - `trees_dir`, `commits_dir`, `wal` — object store paths and WAL handle
   - `current_commit: Option<String>` — hash of latest commit
   - `dirty: bool`, `last_flush: Instant`
 
@@ -86,7 +87,7 @@ data_dir/
 
 | Flag | Purpose |
 |------|---------|
-| `<data_dir>` | Directory for `objects/`, `blobs/`, and `CHANGELOG` |
+| `<data_dir>` | Directory for `objects/`, `blobs/`, and `wal/` |
 | `<mountpoint>` | Where to mount |
 | `--allow-other` | Allow other users to access the mount |
 | `--no-ui` | Disable GUI (used by tests) |
@@ -125,11 +126,11 @@ Each blob is encoded with Reed-Solomon before being written to disk (`reed-solom
 
 ### Metadata persistence (git-like object store)
 
-- `load_metadata()` — on `init()`: reads last line of `CHANGELOG` to find current commit hash, calls `load_from_commit()`; if no CHANGELOG, migrates from legacy `metadata.avro` if present; otherwise bootstraps fresh root inode
-- `flush_metadata()` → `create_commit(message)` — builds tree objects bottom-up for all directories, writes a commit object, appends to `CHANGELOG`; called from `destroy()` and periodically every 30s if dirty
+- `init()` — recovers `okaywal::WriteAheadLog` from `wal/`, extracting the latest commit hash via `ChangelogManager`, then calls `load_metadata()`
+- `load_metadata()` — uses `self.current_commit` (set by WAL recovery) to call `load_from_commit()`; if none, bootstraps fresh root inode
+- `flush_metadata()` → `create_commit()` — builds tree objects bottom-up for all directories, writes a commit object, appends its hash to the WAL; called from `destroy()` and periodically every 30s if dirty
 - `build_tree_for_dir(inode)` — recursively snapshots a directory + all subdirectories into `TreeObject` values stored in `objects/trees/`; returns root tree hash
 - `load_from_commit(hash)` → `load_dir_from_tree()` — reconstructs `inode_meta` and `dir_entries` by walking tree objects from the commit's root tree hash
-- Backward compat: if `CHANGELOG` absent but `metadata.avro` exists, `load_metadata_avro()` loads from AVRO and immediately creates an initial commit
 
 ### Hardlinks & nlink
 

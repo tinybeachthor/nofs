@@ -3,8 +3,6 @@ use fuser::{
     ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite, Request, TimeOrNow,
 };
 use libc;
-use polars::prelude::*;
-use polars::io::avro::AvroReader;
 use sha2::{Digest, Sha256};
 use fastcdc::v2020::FastCDC;
 
@@ -14,7 +12,6 @@ use serde::{Deserialize, Serialize};
 
 use std::collections::HashMap;
 use std::ffi::OsStr;
-use std::io::Write;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -166,7 +163,37 @@ struct CommitObject {
     timestamp_secs: i64,
     next_inode: u64,
     next_fh: u64,
-    message: String,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ChangelogManager {
+    latest_commit: std::sync::Arc<std::sync::Mutex<Option<String>>>,
+}
+
+impl okaywal::LogManager for ChangelogManager {
+    fn recover(&mut self, entry: &mut okaywal::Entry<'_>) -> std::io::Result<()> {
+        if let Some(chunks) = entry.read_all_chunks()? {
+            let mut guard = self.latest_commit.lock().unwrap();
+            for chunk in chunks {
+                *guard = Some(String::from_utf8_lossy(&chunk).into_owned());
+            }
+        }
+        Ok(())
+    }
+
+    fn checkpoint_to(
+        &mut self,
+        _last_checkpointed_id: okaywal::EntryId,
+        _checkpointed_entries: &mut okaywal::SegmentReader,
+        wal: &okaywal::WriteAheadLog,
+    ) -> std::io::Result<()> {
+        if let Some(hash) = self.latest_commit.lock().unwrap().clone() {
+            let mut entry = wal.begin_entry()?;
+            entry.write_chunk(hash.as_bytes())?;
+            entry.commit()?;
+        }
+        Ok(())
+    }
 }
 
 pub struct NofsFS {
@@ -174,7 +201,7 @@ pub struct NofsFS {
     blob_dir: PathBuf,
     trees_dir: PathBuf,
     commits_dir: PathBuf,
-    changelog_path: PathBuf,
+    wal: Option<okaywal::WriteAheadLog>,
 
     current_commit: Option<String>,
 
@@ -195,13 +222,12 @@ impl NofsFS {
         let objects_dir = data_dir.join("objects");
         let trees_dir = objects_dir.join("trees");
         let commits_dir = objects_dir.join("commits");
-        let changelog_path = data_dir.join("CHANGELOG");
         NofsFS {
             data_dir,
             blob_dir,
             trees_dir,
             commits_dir,
-            changelog_path,
+            wal: None,
             current_commit: None,
             inode_meta: HashMap::new(),
             dir_entries: HashMap::new(),
@@ -333,41 +359,11 @@ impl NofsFS {
         serde_json::from_slice(&json).expect("deserialize commit")
     }
 
-    fn read_latest_commit(&self) -> Option<String> {
-        use std::io::{Read, Seek, SeekFrom};
-        // Seek to near the end — each CHANGELOG line is at most a few hundred bytes
-        // (<timestamp> <64-char hash> <message>\n), so 4KB is always more than enough
-        // to contain at least one complete line without reading the whole file.
-        const TAIL: u64 = 4096;
-        let mut file = std::fs::File::open(&self.changelog_path).ok()?;
-        let size = file.seek(SeekFrom::End(0)).ok()?;
-        if size == 0 {
-            return None;
-        }
-        let read_from = size.saturating_sub(TAIL);
-        file.seek(SeekFrom::Start(read_from)).ok()?;
-        let mut buf = vec![0u8; (size - read_from) as usize];
-        file.read_exact(&mut buf).ok()?;
-        // The first bytes may be a partial line if we didn't start at offset 0;
-        // we only care about the last complete line so that's fine.
-        std::str::from_utf8(&buf)
-            .ok()?
-            .lines()
-            .filter(|l| !l.trim().is_empty())
-            .last()
-            .and_then(|line| line.split_whitespace().nth(1))
-            .map(str::to_string)
-    }
-
-    fn append_changelog(&self, commit_hash: &str, message: &str) {
-        let (ts, _) = now_timespec();
-        let line = format!("{} {} {}\n", ts, commit_hash, message);
-        let mut f = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.changelog_path)
-            .expect("open CHANGELOG");
-        f.write_all(line.as_bytes()).expect("write CHANGELOG");
+    fn write_wal_entry(&mut self, commit_hash: &str) {
+        let wal = self.wal.as_mut().expect("WAL not initialized");
+        let mut entry = wal.begin_entry().expect("begin WAL entry");
+        entry.write_chunk(commit_hash.as_bytes()).expect("write WAL chunk");
+        entry.commit().expect("commit WAL entry");
     }
 
     fn build_tree_for_dir(&self, dir_inode: u64) -> String {
@@ -428,7 +424,7 @@ impl NofsFS {
         self.write_tree_object(&tree)
     }
 
-    fn create_commit(&mut self, message: &str) {
+    fn create_commit(&mut self) {
         let root_tree_hash = self.build_tree_for_dir(FUSE_ROOT_INODE);
         let (ts, _) = now_timespec();
         let commit = CommitObject {
@@ -437,10 +433,9 @@ impl NofsFS {
             timestamp_secs: ts,
             next_inode: self.next_inode,
             next_fh: self.next_fh,
-            message: message.to_string(),
         };
         let commit_hash = self.write_commit_object(&commit);
-        self.append_changelog(&commit_hash, message);
+        self.write_wal_entry(&commit_hash);
         self.current_commit = Some(commit_hash);
     }
 
@@ -511,17 +506,8 @@ impl NofsFS {
     // --- Metadata serialization ---
 
     fn load_metadata(&mut self) {
-        // Always load the latest commit (last CHANGELOG entry)
-        if let Some(commit_hash) = self.read_latest_commit() {
-            self.load_from_commit(&commit_hash);
-            return;
-        }
-
-        // Backward compatibility: migrate from metadata.avro if present
-        let legacy_path = self.data_dir.join("metadata.avro");
-        if legacy_path.exists() {
-            self.load_metadata_avro(&legacy_path);
-            self.create_commit("migrate from metadata.avro");
+        if let Some(hash) = self.current_commit.clone() {
+            self.load_from_commit(&hash);
             return;
         }
 
@@ -551,78 +537,8 @@ impl NofsFS {
         self.next_inode = 2;
     }
 
-    fn load_metadata_avro(&mut self, path: &std::path::Path) {
-        let file = std::fs::File::open(path).expect("Failed to open metadata");
-        let df = AvroReader::new(file)
-            .finish()
-            .expect("Failed to read AVRO");
-
-        let col_inode = df.column("inode").unwrap().i64().unwrap();
-        let col_parent = df.column("parent_inode").unwrap().i64().unwrap();
-        let col_name = df.column("name").unwrap().str().unwrap();
-        let col_ft = df.column("file_type").unwrap().i32().unwrap();
-        let col_perm = df.column("permissions").unwrap().i32().unwrap();
-        let col_uid = df.column("uid").unwrap().i32().unwrap();
-        let col_gid = df.column("gid").unwrap().i32().unwrap();
-        let col_size = df.column("size").unwrap().i64().unwrap();
-        let col_nlink = df.column("nlink").unwrap().i32().unwrap();
-        let col_atime_s = df.column("atime_secs").unwrap().i64().unwrap();
-        let col_atime_ns = df.column("atime_nsecs").unwrap().i32().unwrap();
-        let col_mtime_s = df.column("mtime_secs").unwrap().i64().unwrap();
-        let col_mtime_ns = df.column("mtime_nsecs").unwrap().i32().unwrap();
-        let col_ctime_s = df.column("ctime_secs").unwrap().i64().unwrap();
-        let col_ctime_ns = df.column("ctime_nsecs").unwrap().i32().unwrap();
-        let col_blob = df.column("blob_hashes").unwrap().str().unwrap();
-        let col_symlink = df.column("symlink_target").unwrap().str().unwrap();
-        let col_rdev = df.column("rdev").unwrap().i32().unwrap();
-
-        let mut max_inode: u64 = 0;
-        for i in 0..df.height() {
-            let inode = col_inode.get(i).unwrap() as u64;
-            let parent_inode = col_parent.get(i).unwrap() as u64;
-            let name = col_name.get(i).unwrap();
-
-            if parent_inode > 0 && !name.is_empty() {
-                self.dir_entries
-                    .insert((parent_inode, name.to_string()), inode);
-            }
-
-            if !self.inode_meta.contains_key(&inode) {
-                self.inode_meta.insert(
-                    inode,
-                    InodeMeta {
-                        inode,
-                        file_type: u8_to_file_type(col_ft.get(i).unwrap() as u8),
-                        permissions: col_perm.get(i).unwrap() as u16,
-                        uid: col_uid.get(i).unwrap() as u32,
-                        gid: col_gid.get(i).unwrap() as u32,
-                        size: col_size.get(i).unwrap() as u64,
-                        nlink: col_nlink.get(i).unwrap() as u32,
-                        atime_secs: col_atime_s.get(i).unwrap(),
-                        atime_nsecs: col_atime_ns.get(i).unwrap() as u32,
-                        mtime_secs: col_mtime_s.get(i).unwrap(),
-                        mtime_nsecs: col_mtime_ns.get(i).unwrap() as u32,
-                        ctime_secs: col_ctime_s.get(i).unwrap(),
-                        ctime_nsecs: col_ctime_ns.get(i).unwrap() as u32,
-                        blob_hashes: col_blob
-                            .get(i)
-                            .filter(|s| !s.is_empty())
-                            .map(|s| s.split(',').map(str::to_string).collect())
-                            .unwrap_or_default(),
-                        symlink_target: col_symlink.get(i).map(|s: &str| s.to_string()),
-                        rdev: col_rdev.get(i).unwrap() as u32,
-                    },
-                );
-            }
-
-            max_inode = max_inode.max(inode);
-        }
-
-        self.next_inode = max_inode + 1;
-    }
-
     fn flush_metadata(&mut self) {
-        self.create_commit("periodic flush");
+        self.create_commit();
     }
 
 
@@ -666,6 +582,14 @@ impl Filesystem for NofsFS {
         std::fs::create_dir_all(&self.blob_dir).map_err(|_| libc::EIO)?;
         std::fs::create_dir_all(&self.trees_dir).map_err(|_| libc::EIO)?;
         std::fs::create_dir_all(&self.commits_dir).map_err(|_| libc::EIO)?;
+        let wal_dir = self.data_dir.join("wal");
+        std::fs::create_dir_all(&wal_dir).map_err(|_| libc::EIO)?;
+        let manager = ChangelogManager::default();
+        let latest_commit = manager.latest_commit.clone();
+        let wal = okaywal::WriteAheadLog::recover(&wal_dir, manager)
+            .map_err(|_| libc::EIO)?;
+        self.wal = Some(wal);
+        self.current_commit = latest_commit.lock().unwrap().clone();
         self.load_metadata();
         Ok(())
     }
