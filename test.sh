@@ -105,18 +105,22 @@ RS_HASH=$(printf '%s\n' "$RS_CONTENT" | sha256sum | awk '{print $1}')
 RS_BLOB="$DATA/blobs/${RS_HASH:0:2}/${RS_HASH:2}"
 [[ -f "$RS_BLOB" ]] || fail "RS recovery: blob not found at $RS_BLOB"
 
-python3 - "$RS_BLOB" <<'PYEOF'
-import struct, sys
-data = open(sys.argv[1], 'rb').read()
-_, shard_size = struct.unpack_from('<QQ', data, 0)
-shard_size = int(shard_size)
-result = bytearray(data)
-# Corrupt the first byte of 4 data shards — one more than any single parity shard can cover
-for i in [0, 2, 4, 6]:
-    data_offset = 16 + i * (4 + shard_size) + 4
-    result[data_offset] ^= 0xFF
-open(sys.argv[1], 'wb').write(result)
-PYEOF
+# Read shard_size from blob header (bytes 8–15, little-endian u64)
+_rs_read_byte() { dd if="$1" bs=1 skip="$2" count=1 2>/dev/null | od -An -tu1 | tr -d ' \n'; }
+RS_SHARD_SIZE=0
+for _i in 0 1 2 3 4 5 6 7; do
+    _b=$(_rs_read_byte "$RS_BLOB" $(( 8 + _i )))
+    RS_SHARD_SIZE=$(( RS_SHARD_SIZE + _b * (1 << (8 * _i)) ))
+done
+
+# Flip first data byte of shards 0, 2, 4, 6 (4 shards = PARITY_SHARDS)
+# Shard i data offset: 16 + i*(4 + shard_size) + 4
+for _i in 0 2 4 6; do
+    _off=$(( 16 + _i * (4 + RS_SHARD_SIZE) + 4 ))
+    _b=$(_rs_read_byte "$RS_BLOB" "$_off")
+    printf "\\$(printf '%03o' $(( _b ^ 255 )))" \
+        | dd of="$RS_BLOB" bs=1 seek="$_off" conv=notrunc 2>/dev/null
+done
 
 start_mount
 [[ "$(cat "$MOUNT/rs_test.txt")" == "rs recovery" ]] || fail "RS recovery: content mismatch after 4 shards corrupted"
