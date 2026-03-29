@@ -20,7 +20,7 @@ Unit tests for `reed_solomon` run without FUSE and cover round-trips, empty inpu
 
 ```
 src/
-  main.rs          — CLI (clap), thread orchestration, GUI (NofsApp stub)
+  main.rs          — CLI (clap), thread orchestration, GUI (NofsApp with file tree)
   fs.rs            — NofsFS struct implementing fuser::Filesystem, ChangelogManager, FUSE ops
   blob.rs          — Blob storage layer: read/write/CDC-chunk blobs (pure functions)
   store.rs         — Object store layer: TreeEntry/TreeObject/CommitObject structs + read/write fns
@@ -62,6 +62,8 @@ data_dir/
 - `TreeObject` — directory inode metadata + sorted `entries: Vec<TreeEntry>`; serialized as JSON, content-addressed by SHA-256
 - `CommitObject` — `parent_hash`, `root_tree_hash`, `timestamp_secs`, `next_inode`, `next_fh`; serialized as JSON, content-addressed
 - `ChangelogManager` — `okaywal::LogManager` impl; stores latest commit hash via `Arc<Mutex<Option<String>>>` shared with `init()` for post-recovery extraction
+- `FsEntry` — snapshot entry: `inode`, `name`, `file_type`, `size`
+- `FsSnapshot` — flat list of `(parent_inode, FsEntry)` pairs shared with GUI
 - `NofsFS` — main state:
   - `inode_meta: HashMap<u64, InodeMeta>`
   - `dir_entries: HashMap<(u64, String), u64>` — (parent_inode, name) → child_inode
@@ -71,11 +73,14 @@ data_dir/
   - `trees_dir`, `commits_dir`, `wal` — object store paths and WAL handle
   - `current_commit: Option<String>` — hash of latest commit
   - `dirty: bool`, `last_flush: Instant`
+  - `snapshot_tx: Arc<Mutex<FsSnapshot>>` — shared with GUI thread
 
 ### Two-thread model (default mode)
 
-- Main thread: `eframe::run_native()` — GUI event loop (shows a stub "nofs" label window)
+- Main thread: `eframe::run_native()` — GUI event loop showing a live file tree
 - Spawned thread: `fuser::mount2()` — blocking FUSE mount serving all filesystem ops
+
+**GUI ↔ FUSE communication:** `Arc<Mutex<FsSnapshot>>` shared between threads. The FUSE thread calls `publish_snapshot()` after every mutating operation, writing a flat `Vec<(parent_inode, FsEntry)>`. The GUI thread calls `try_lock()` each frame (non-blocking) to refresh its cached snapshot, then renders a recursive collapsible tree via egui `CollapsingHeader`. Repaint is requested every 500ms.
 
 **Lifecycle:** closing the GUI window calls `fusermount3 -u` to unmount; if the FUSE mount exits externally, the spawned thread calls `std::process::exit(0)`.
 
