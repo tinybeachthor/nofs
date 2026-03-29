@@ -11,7 +11,21 @@ use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+#[derive(Clone, Debug)]
+pub struct FsEntry {
+    pub inode: u64,
+    pub name: String,
+    pub file_type: FileType,
+    pub size: u64,
+}
+
+#[derive(Clone, Default, Debug)]
+pub struct FsSnapshot {
+    pub entries: Vec<(u64, FsEntry)>,
+}
 
 const TTL: Duration = Duration::from_secs(1);
 const FUSE_ROOT_INODE: u64 = 1;
@@ -160,10 +174,11 @@ pub struct NofsFS {
     lookup_cnt: HashMap<u64, u64>,
     dirty: bool,
     last_flush: Instant,
+    snapshot_tx: Arc<Mutex<FsSnapshot>>,
 }
 
 impl NofsFS {
-    pub fn new(data_dir: PathBuf) -> Self {
+    pub fn new(data_dir: PathBuf, snapshot_tx: Arc<Mutex<FsSnapshot>>) -> Self {
         let blob_dir = data_dir.join("blobs");
         let objects_dir = data_dir.join("objects");
         let trees_dir = objects_dir.join("trees");
@@ -183,6 +198,7 @@ impl NofsFS {
             lookup_cnt: HashMap::new(),
             dirty: false,
             last_flush: Instant::now(),
+            snapshot_tx,
         }
     }
 
@@ -213,6 +229,31 @@ impl NofsFS {
     fn mark_dirty(&mut self) {
         self.dirty = true;
         self.maybe_flush();
+    }
+
+    fn publish_snapshot(&self) {
+        let mut entries = Vec::with_capacity(self.dir_entries.len() + 1);
+        if let Some(m) = self.inode_meta.get(&FUSE_ROOT_INODE) {
+            entries.push((0u64, FsEntry {
+                inode: FUSE_ROOT_INODE,
+                name: "/".to_string(),
+                file_type: m.file_type,
+                size: m.size,
+            }));
+        }
+        for ((parent_ino, name), &child_ino) in &self.dir_entries {
+            if let Some(m) = self.inode_meta.get(&child_ino) {
+                entries.push((*parent_ino, FsEntry {
+                    inode: child_ino,
+                    name: name.clone(),
+                    file_type: m.file_type,
+                    size: m.size,
+                }));
+            }
+        }
+        if let Ok(mut snap) = self.snapshot_tx.lock() {
+            snap.entries = entries;
+        }
     }
 
     fn maybe_flush(&mut self) {
@@ -434,6 +475,7 @@ impl NofsFS {
         }
 
         self.dirty = true;
+        self.publish_snapshot();
     }
 }
 
@@ -455,6 +497,7 @@ impl Filesystem for NofsFS {
         self.wal = Some(wal);
         self.current_commit = latest_commit.lock().unwrap().clone();
         self.load_metadata();
+        self.publish_snapshot();
         Ok(())
     }
 
@@ -634,6 +677,7 @@ impl Filesystem for NofsFS {
         }
 
         self.mark_dirty();
+        self.publish_snapshot();
 
         match self.inode_meta.get(&ino) {
             Some(m) => {
@@ -719,6 +763,7 @@ impl Filesystem for NofsFS {
 
         *self.lookup_cnt.entry(ino).or_insert(0) += 1;
         self.mark_dirty();
+        self.publish_snapshot();
 
         let attr = self.inode_meta.get(&ino).unwrap().to_file_attr();
         reply.entry(&TTL, &attr, 0);
@@ -781,6 +826,7 @@ impl Filesystem for NofsFS {
 
         *self.lookup_cnt.entry(ino).or_insert(0) += 1;
         self.mark_dirty();
+        self.publish_snapshot();
 
         let attr = self.inode_meta.get(&ino).unwrap().to_file_attr();
         reply.entry(&TTL, &attr, 0);
@@ -822,6 +868,7 @@ impl Filesystem for NofsFS {
         }
 
         self.mark_dirty();
+        self.publish_snapshot();
         reply.ok();
     }
 
@@ -857,6 +904,7 @@ impl Filesystem for NofsFS {
         }
 
         self.mark_dirty();
+        self.publish_snapshot();
         reply.ok();
     }
 
@@ -919,6 +967,7 @@ impl Filesystem for NofsFS {
 
         *self.lookup_cnt.entry(ino).or_insert(0) += 1;
         self.mark_dirty();
+        self.publish_snapshot();
 
         let attr = self.inode_meta.get(&ino).unwrap().to_file_attr();
         reply.entry(&TTL, &attr, 0);
@@ -977,6 +1026,7 @@ impl Filesystem for NofsFS {
         }
 
         self.mark_dirty();
+        self.publish_snapshot();
         reply.ok();
     }
 
@@ -1017,6 +1067,7 @@ impl Filesystem for NofsFS {
 
         *self.lookup_cnt.entry(ino).or_insert(0) += 1;
         self.mark_dirty();
+        self.publish_snapshot();
 
         let attr = self.inode_meta.get(&ino).unwrap().to_file_attr();
         reply.entry(&TTL, &attr, 0);
@@ -1259,6 +1310,7 @@ impl Filesystem for NofsFS {
 
         *self.lookup_cnt.entry(ino).or_insert(0) += 1;
         self.mark_dirty();
+        self.publish_snapshot();
 
         let attr = self.inode_meta.get(&ino).unwrap().to_file_attr();
         reply.created(&TTL, &attr, 0, fh, 0);
