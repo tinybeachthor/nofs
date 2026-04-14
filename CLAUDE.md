@@ -1,0 +1,36 @@
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+## Commands
+
+JS/frontend (use **bun** — lockfile is `bun.lock`, not npm/pnpm):
+
+- `bun install` — install JS deps
+- `bun run dev` — Vite dev server on port 1420 (port is fixed by Tauri convention)
+- `bun run build` — `tsc` typecheck + Vite production build into `dist/`
+- `bun run tauri dev` — run the desktop app; Tauri spawns `bun run dev` automatically via `beforeDevCommand`
+- `bun run tauri build` — build distributable bundle
+
+Rust/backend (from `src-tauri/`):
+
+- `cargo check` / `cargo build` / `cargo test`
+
+No linter or JS test runner is configured.
+
+## Architecture
+
+Two-process Tauri 2 desktop app (React 19 + TS frontend, Rust backend).
+
+- **Frontend** — `src/`, entry `src/main.tsx` → `src/App.tsx`. Vite builds to `dist/`, which Tauri consumes via `frontendDist: "../dist"` in `src-tauri/tauri.conf.json`.
+- **Backend** — Rust crate in `src-tauri/` (lib name `nofs_lib`, binary `nofs`). Entry: `src-tauri/src/main.rs` → `lib.rs::run()`.
+- **Frontend ↔ Rust bridge** — `invoke("cmd_name", args)` from `@tauri-apps/api/core` calls `#[tauri::command]` functions registered inside `tauri::Builder::default().invoke_handler(tauri::generate_handler![...])` in `src-tauri/src/lib.rs`. See the `greet` command for the canonical pattern.
+- **Capabilities/permissions** — declared in `src-tauri/capabilities/`; required for any Tauri plugin/API surface exposed to the webview.
+- **Config** — `src-tauri/tauri.conf.json` controls window, bundling, dev URL, identifier (`com.martin.nofs`).
+- **Plugins enabled** — `tauri-plugin-opener`.
+
+## When adding a new Rust command
+
+1. Define `#[tauri::command] fn foo(...)` in `src-tauri/src/lib.rs`.
+2. Register it in `generate_handler![greet, foo]`.
+3. If it uses a plugin API, grant the capability in `src-tauri/capabilities/`.
