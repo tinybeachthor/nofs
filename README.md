@@ -1,7 +1,18 @@
-# Tauri + React + Typescript
+# nofs
 
-This template should help get you started developing with Tauri, React and Typescript in Vite.
+A minimal desktop file browser built with Tauri 2, React 19, and TypeScript.
 
-## Recommended IDE Setup
+The Rust backend owns all filesystem access and exposes a single `list_dir` command; the frontend is a pure view that renders the current path in a topbar, lists entries, and lets you descend into folders or navigate up one level.
 
-- [VS Code](https://code.visualstudio.com/) + [Tauri](https://marketplace.visualstudio.com/items?itemName=tauri-apps.tauri-vscode) + [rust-analyzer](https://marketplace.visualstudio.com/items?itemName=rust-lang.rust-analyzer)
+## Develop
+
+```sh
+bun install
+bun run tauri dev
+```
+
+## Build
+
+```sh
+bun run tauri build
+```

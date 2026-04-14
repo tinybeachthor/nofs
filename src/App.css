@@ -1,14 +1,7 @@
-.logo.vite:hover {
-  filter: drop-shadow(0 0 2em #747bff);
-}
-
-.logo.react:hover {
-  filter: drop-shadow(0 0 2em #61dafb);
-}
 :root {
   font-family: Inter, Avenir, Helvetica, Arial, sans-serif;
-  font-size: 16px;
-  line-height: 24px;
+  font-size: 14px;
+  line-height: 20px;
   font-weight: 400;
 
   color: #0f0f0f;
@@ -18,81 +11,98 @@
   text-rendering: optimizeLegibility;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
-  -webkit-text-size-adjust: 100%;
 }
 
-.container {
+body {
   margin: 0;
-  padding-top: 10vh;
+}
+
+.fb {
   display: flex;
   flex-direction: column;
-  justify-content: center;
-  text-align: center;
+  height: 100vh;
 }
 
-.logo {
-  height: 6em;
-  padding: 1.5em;
-  will-change: filter;
-  transition: 0.75s;
-}
-
-.logo.tauri:hover {
-  filter: drop-shadow(0 0 2em #24c8db);
-}
-
-.row {
+.fb-topbar {
   display: flex;
-  justify-content: center;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  border-bottom: 1px solid rgba(0, 0, 0, 0.1);
+  background-color: #fff;
+  position: sticky;
+  top: 0;
 }
 
-a {
-  font-weight: 500;
-  color: #646cff;
-  text-decoration: inherit;
-}
-
-a:hover {
-  color: #535bf2;
-}
-
-h1 {
-  text-align: center;
-}
-
-input,
-button {
-  border-radius: 8px;
-  border: 1px solid transparent;
-  padding: 0.6em 1.2em;
-  font-size: 1em;
-  font-weight: 500;
-  font-family: inherit;
-  color: #0f0f0f;
-  background-color: #ffffff;
-  transition: border-color 0.25s;
-  box-shadow: 0 2px 2px rgba(0, 0, 0, 0.2);
-}
-
-button {
+.fb-up {
+  border-radius: 6px;
+  border: 1px solid rgba(0, 0, 0, 0.15);
+  padding: 4px 10px;
+  font-size: 0.9em;
+  background-color: #fff;
   cursor: pointer;
 }
 
-button:hover {
-  border-color: #396cd8;
-}
-button:active {
-  border-color: #396cd8;
-  background-color: #e8e8e8;
+.fb-up:disabled {
+  opacity: 0.4;
+  cursor: default;
 }
 
-input,
-button {
-  outline: none;
+.fb-path {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.9em;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  flex: 1;
 }
 
-#greet-input {
-  margin-right: 5px;
+.fb-error {
+  padding: 8px 12px;
+  color: #b00020;
+  background-color: #fde7ea;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.85em;
+}
+
+.fb-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  overflow-y: auto;
+  flex: 1;
+}
+
+.fb-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 12px;
+  user-select: none;
+}
+
+.fb-row-dir {
+  cursor: pointer;
+}
+
+.fb-row-dir:hover {
+  background-color: rgba(0, 0, 0, 0.05);
+}
+
+.fb-glyph {
+  width: 1em;
+  text-align: center;
+  color: #888;
+}
+
+.fb-row-dir .fb-glyph {
+  color: #396cd8;
+}
+
+.fb-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 @media (prefers-color-scheme: dark) {
@@ -101,16 +111,23 @@ button {
     background-color: #2f2f2f;
   }
 
-  a:hover {
-    color: #24c8db;
+  .fb-topbar {
+    background-color: #1f1f1f;
+    border-bottom-color: rgba(255, 255, 255, 0.1);
   }
 
-  input,
-  button {
-    color: #ffffff;
+  .fb-up {
     background-color: #0f0f0f98;
+    color: #fff;
+    border-color: rgba(255, 255, 255, 0.15);
   }
-  button:active {
-    background-color: #0f0f0f69;
+
+  .fb-row-dir:hover {
+    background-color: rgba(255, 255, 255, 0.07);
+  }
+
+  .fb-error {
+    color: #ff8a95;
+    background-color: #3a1a1f;
   }
 }
