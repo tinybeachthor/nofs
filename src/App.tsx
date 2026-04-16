@@ -89,14 +89,34 @@ function App() {
   return (
     <main className="fb">
       <header className="fb-topbar">
-        <button
-          className="fb-up"
-          onClick={() => listing?.parent && loadDir(listing.parent)}
-          disabled={!listing?.parent}
-        >
-          ↑ Up
-        </button>
-        <span className="fb-path">{listing?.path ?? ""}</span>
+        <nav className="fb-breadcrumbs">
+          {listing
+            ? listing.path
+                .split("/")
+                .filter((_, i, arr) => i < arr.length) // keep all including empty root
+                .reduce<{ label: string; path: string }[]>((acc, segment, i, arr) => {
+                  if (i === 0 && segment === "") {
+                    acc.push({ label: "/", path: "/" });
+                  } else if (segment !== "") {
+                    const path = arr.slice(0, i + 1).join("/") || "/";
+                    acc.push({ label: segment, path });
+                  }
+                  return acc;
+                }, [])
+                .map((crumb, i, arr) => (
+                  <span key={crumb.path} className="fb-crumb-item">
+                    {i > 0 && <span className="fb-crumb-sep">/</span>}
+                    {i === arr.length - 1 ? (
+                      <span className="fb-crumb fb-crumb-current">{crumb.label}</span>
+                    ) : (
+                      <button className="fb-crumb" onClick={() => loadDir(crumb.path)}>
+                        {crumb.label}
+                      </button>
+                    )}
+                  </span>
+                ))
+            : null}
+        </nav>
       </header>
 
       {error && <div className="fb-error">{error}</div>}
