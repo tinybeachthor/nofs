@@ -16,7 +16,7 @@ type Listing = {
 
 function FolderIcon() {
   return (
-    <svg width="80" height="64" viewBox="0 0 80 64" fill="none" xmlns="http://www.w3.org/2000/svg">
+    <svg width="80" height="80" viewBox="0 0 80 80" fill="none" xmlns="http://www.w3.org/2000/svg">
       <defs>
         <linearGradient id="folderBack" x1="0" y1="0" x2="0" y2="1">
           <stop offset="0%" stopColor="#4a6fa5" />
@@ -37,15 +37,15 @@ function FolderIcon() {
         </linearGradient>
       </defs>
       {/* Tab */}
-      <path d="M4 18 Q4 14 8 14 L28 14 Q32 14 34 18 L36 22 L4 22 Z" fill="url(#tabGrad)" />
+      <path d="M4 20 Q4 14 8 14 L30 14 Q34 14 36 20 L38 26 L4 26 Z" fill="url(#tabGrad)" />
       {/* Folder back */}
-      <rect x="4" y="20" width="72" height="40" rx="5" fill="url(#folderBack)" />
+      <rect x="4" y="24" width="72" height="50" rx="5" fill="url(#folderBack)" />
       {/* Folder front face */}
-      <rect x="4" y="26" width="72" height="34" rx="5" fill="url(#folderFront)" />
+      <rect x="4" y="30" width="72" height="44" rx="5" fill="url(#folderFront)" />
       {/* Sheen highlight */}
-      <rect x="4" y="26" width="72" height="18" rx="5" fill="url(#folderSheen)" />
+      <rect x="4" y="30" width="72" height="22" rx="5" fill="url(#folderSheen)" />
       {/* Bottom edge shadow */}
-      <rect x="4" y="54" width="72" height="6" rx="3" fill="#1a3870" opacity="0.5" />
+      <rect x="4" y="68" width="72" height="6" rx="3" fill="#1a3870" opacity="0.5" />
     </svg>
   );
 }
