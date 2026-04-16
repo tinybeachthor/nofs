@@ -30,6 +30,13 @@ Two-process Tauri 2 desktop app (React 19 + TS frontend, Rust backend).
 - **Config** — `src-tauri/tauri.conf.json` controls window, bundling, dev URL, identifier (`com.martin.nofs`).
 - **Plugins enabled** — `tauri-plugin-opener`.
 
+## UI
+
+- Dark macOS-style design (`#1c1c1e` background, system fonts).
+- Files and folders rendered as tiles in a responsive CSS grid (`repeat(auto-fill, minmax(120px, 1fr))`).
+- SVG icons: `FolderIcon` (blue gradient folder) and `FileIcon` (grey document) defined inline in `App.tsx`.
+- Topbar shows a clickable breadcrumb trail — each path segment navigates directly to that directory; the current segment is non-interactive.
+
 ## When adding a new Rust command
 
 1. Define `#[tauri::command] fn foo(...) -> Result<T, String>` in `src-tauri/src/lib.rs` (return types must be `Serialize`; map errors to `String` with `.map_err(|e| e.to_string())`).
