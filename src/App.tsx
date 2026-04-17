@@ -98,6 +98,45 @@ function FileIcon() {
   );
 }
 
+function ImageIcon() {
+  return (
+    <svg width="64" height="80" viewBox="0 0 64 80" fill="none" xmlns="http://www.w3.org/2000/svg">
+      <defs>
+        <linearGradient id="imgBg" x1="0" y1="0" x2="0" y2="1">
+          <stop offset="0%" stopColor="#d4eaff" />
+          <stop offset="100%" stopColor="#aacfee" />
+        </linearGradient>
+      </defs>
+      <path d="M8 4 L44 4 L56 16 L56 76 Q56 78 54 78 L10 78 Q8 78 8 76 Z" fill="url(#imgBg)" />
+      <path d="M44 4 L44 16 L56 16 Z" fill="#7aaece" />
+      {/* sky */}
+      <rect x="14" y="30" width="36" height="30" rx="3" fill="#c0dff5" />
+      {/* sun */}
+      <circle cx="26" cy="38" r="5" fill="#f5c842" />
+      {/* mountains */}
+      <path d="M14 60 L28 42 L38 54 L44 48 L50 60 Z" fill="#5a9fd4" />
+    </svg>
+  );
+}
+
+function PdfIcon() {
+  return (
+    <svg width="64" height="80" viewBox="0 0 64 80" fill="none" xmlns="http://www.w3.org/2000/svg">
+      <defs>
+        <linearGradient id="pdfBg" x1="0" y1="0" x2="0" y2="1">
+          <stop offset="0%" stopColor="#fde0de" />
+          <stop offset="100%" stopColor="#f4b8b4" />
+        </linearGradient>
+      </defs>
+      <path d="M8 4 L44 4 L56 16 L56 76 Q56 78 54 78 L10 78 Q8 78 8 76 Z" fill="url(#pdfBg)" />
+      <path d="M44 4 L44 16 L56 16 Z" fill="#d47a76" />
+      <text x="32" y="58" textAnchor="middle" fontFamily="-apple-system, BlinkMacSystemFont, sans-serif" fontWeight="700" fontSize="16" fill="#c0392b" letterSpacing="0.5">PDF</text>
+      <rect x="14" y="34" width="36" height="2.5" rx="1.25" fill="#d47a76" opacity="0.6" />
+      <rect x="14" y="40" width="28" height="2.5" rx="1.25" fill="#d47a76" opacity="0.6" />
+    </svg>
+  );
+}
+
 function PreviewPanel({ state, onClose, width }: { state: PreviewState; onClose: () => void; width: number }) {
   return (
     <aside className="fb-preview" style={{ width }}>
@@ -250,7 +289,12 @@ function App() {
                 }}
               >
                 <div className="fb-tile-icon">
-                  {e.is_dir ? <FolderIcon /> : <FileIcon />}
+                  {e.is_dir ? <FolderIcon /> : (() => {
+                    const mime = mediaMime(e.name);
+                    if (mime?.startsWith("image/")) return <ImageIcon />;
+                    if (mime === "application/pdf") return <PdfIcon />;
+                    return <FileIcon />;
+                  })()}
                 </div>
                 <span className="fb-tile-name">{e.name}</span>
               </div>
