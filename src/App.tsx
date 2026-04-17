@@ -14,6 +14,16 @@ type Listing = {
   entries: DirEntry[];
 };
 
+type FilePreview =
+  | { kind: "Text"; content: string; truncated: boolean }
+  | { kind: "Binary" };
+
+type PreviewState = {
+  entry: DirEntry;
+  preview: FilePreview | null;
+  error: string | null;
+};
+
 function FolderIcon() {
   return (
     <svg width="80" height="80" viewBox="0 0 80 80" fill="none" xmlns="http://www.w3.org/2000/svg">
@@ -68,9 +78,37 @@ function FileIcon() {
   );
 }
 
+function PreviewPanel({ state, onClose }: { state: PreviewState; onClose: () => void }) {
+  return (
+    <aside className="fb-preview">
+      <header className="fb-preview-header">
+        <span className="fb-preview-title">{state.entry.name}</span>
+        <button className="fb-preview-close" onClick={onClose} aria-label="Close preview">✕</button>
+      </header>
+      <div className="fb-preview-body">
+        {state.error ? (
+          <p className="fb-preview-error">{state.error}</p>
+        ) : state.preview === null ? (
+          <p className="fb-preview-meta">Loading…</p>
+        ) : state.preview.kind === "Binary" ? (
+          <p className="fb-preview-meta">Binary file — no preview available.</p>
+        ) : (
+          <>
+            <pre className="fb-preview-text">{state.preview.content}</pre>
+            {state.preview.truncated && (
+              <p className="fb-preview-meta">Showing first 64 KB</p>
+            )}
+          </>
+        )}
+      </div>
+    </aside>
+  );
+}
+
 function App() {
   const [listing, setListing] = useState<Listing | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [preview, setPreview] = useState<PreviewState | null>(null);
 
   async function loadDir(path: string | null) {
     try {
@@ -80,6 +118,20 @@ function App() {
     } catch (e) {
       setError(String(e));
     }
+  }
+
+  async function openPreview(entry: DirEntry) {
+    setPreview({ entry, preview: null, error: null });
+    try {
+      const result = await invoke<FilePreview>("read_file", { path: entry.path });
+      setPreview({ entry, preview: result, error: null });
+    } catch (e) {
+      setPreview({ entry, preview: null, error: String(e) });
+    }
+  }
+
+  function closePreview() {
+    setPreview(null);
   }
 
   useEffect(() => {
@@ -93,7 +145,7 @@ function App() {
           {listing
             ? listing.path
                 .split("/")
-                .filter((_, i, arr) => i < arr.length) // keep all including empty root
+                .filter((_, i, arr) => i < arr.length)
                 .reduce<{ label: string; path: string }[]>((acc, segment, i, arr) => {
                   if (i === 0 && segment === "") {
                     acc.push({ label: "/", path: "/" });
@@ -121,22 +173,30 @@ function App() {
 
       {error && <div className="fb-error">{error}</div>}
 
-      {listing && (
-        <div className="fb-grid">
-          {listing.entries.map((e) => (
-            <div
-              key={e.path}
-              className={`fb-tile ${e.is_dir ? "fb-tile-dir" : "fb-tile-file"}`}
-              onClick={() => e.is_dir && loadDir(e.path)}
-            >
-              <div className="fb-tile-icon">
-                {e.is_dir ? <FolderIcon /> : <FileIcon />}
+      <div className="fb-content">
+        {listing && (
+          <div className="fb-grid">
+            {listing.entries.map((e) => (
+              <div
+                key={e.path}
+                className={`fb-tile ${e.is_dir ? "fb-tile-dir" : "fb-tile-file"}${preview?.entry.path === e.path ? " fb-tile-selected" : ""}`}
+                onClick={() => {
+                  if (e.is_dir) { closePreview(); loadDir(e.path); }
+                  else { openPreview(e); }
+                }}
+              >
+                <div className="fb-tile-icon">
+                  {e.is_dir ? <FolderIcon /> : <FileIcon />}
+                </div>
+                <span className="fb-tile-name">{e.name}</span>
               </div>
-              <span className="fb-tile-name">{e.name}</span>
-            </div>
-          ))}
-        </div>
-      )}
+            ))}
+          </div>
+        )}
+        {preview && (
+          <PreviewPanel state={preview} onClose={closePreview} />
+        )}
+      </div>
     </main>
   );
 }

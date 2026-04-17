@@ -17,6 +17,32 @@ struct Listing {
     entries: Vec<DirEntry>,
 }
 
+#[derive(Serialize)]
+#[serde(tag = "kind")]
+enum FilePreview {
+    Text { content: String, truncated: bool },
+    Binary,
+}
+
+const PREVIEW_LIMIT: u64 = 64 * 1024;
+
+#[tauri::command]
+fn read_file(path: String) -> Result<FilePreview, String> {
+    use std::io::Read;
+    let file = std::fs::File::open(&path).map_err(|e| format!("{path}: {e}"))?;
+    let meta = file.metadata().map_err(|e| e.to_string())?;
+    let mut buf = Vec::new();
+    std::io::BufReader::new(file)
+        .take(PREVIEW_LIMIT)
+        .read_to_end(&mut buf)
+        .map_err(|e| e.to_string())?;
+    let truncated = meta.len() > PREVIEW_LIMIT;
+    match String::from_utf8(buf) {
+        Ok(content) => Ok(FilePreview::Text { content, truncated }),
+        Err(_) => Ok(FilePreview::Binary),
+    }
+}
+
 #[tauri::command]
 fn list_dir(path: Option<String>, app: tauri::AppHandle) -> Result<Listing, String> {
     let dir: PathBuf = match path {
@@ -99,7 +125,7 @@ fn set_macos_background(window: &tauri::WebviewWindow) {
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
-        .invoke_handler(tauri::generate_handler![list_dir])
+        .invoke_handler(tauri::generate_handler![list_dir, read_file])
         .setup(|app| {
             let window = app.get_webview_window("main").unwrap();
             #[cfg(target_os = "macos")]
