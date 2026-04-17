@@ -1,5 +1,3 @@
-use std::path::PathBuf;
-
 use serde::Serialize;
 use tauri::ipc::Response;
 use tauri::Manager;
@@ -27,23 +25,38 @@ enum FilePreview {
 
 const PREVIEW_LIMIT: u64 = 64 * 1024;
 
+struct VfsState {
+    root: vfs::VfsPath,
+}
+
+fn vfs_resolve(root: &vfs::VfsPath, path: &str) -> Result<vfs::VfsPath, String> {
+    let rel = path.trim_start_matches('/');
+    if rel.is_empty() {
+        Ok(root.clone())
+    } else {
+        root.join(rel).map_err(|e| e.to_string())
+    }
+}
+
 #[tauri::command]
-fn stream_file(path: String) -> Result<Response, String> {
-    let bytes = std::fs::read(&path).map_err(|e| format!("{path}: {e}"))?;
+fn stream_file(path: String, vfs: tauri::State<'_, VfsState>) -> Result<Response, String> {
+    use std::io::Read;
+    let vfs_path = vfs_resolve(&vfs.root, &path)?;
+    let mut file = vfs_path.open_file().map_err(|e| e.to_string())?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).map_err(|e| e.to_string())?;
     Ok(Response::new(bytes))
 }
 
 #[tauri::command]
-fn read_file(path: String) -> Result<FilePreview, String> {
+fn read_file(path: String, vfs: tauri::State<'_, VfsState>) -> Result<FilePreview, String> {
     use std::io::Read;
-    let file = std::fs::File::open(&path).map_err(|e| format!("{path}: {e}"))?;
-    let meta = file.metadata().map_err(|e| e.to_string())?;
+    let vfs_path = vfs_resolve(&vfs.root, &path)?;
+    let meta = vfs_path.metadata().map_err(|e| e.to_string())?;
+    let file = vfs_path.open_file().map_err(|e| e.to_string())?;
     let mut buf = Vec::new();
-    std::io::BufReader::new(file)
-        .take(PREVIEW_LIMIT)
-        .read_to_end(&mut buf)
-        .map_err(|e| e.to_string())?;
-    let truncated = meta.len() > PREVIEW_LIMIT;
+    file.take(PREVIEW_LIMIT).read_to_end(&mut buf).map_err(|e| e.to_string())?;
+    let truncated = meta.len > PREVIEW_LIMIT;
     match String::from_utf8(buf) {
         Ok(content) => Ok(FilePreview::Text { content, truncated }),
         Err(_) => Ok(FilePreview::Binary),
@@ -51,27 +64,21 @@ fn read_file(path: String) -> Result<FilePreview, String> {
 }
 
 #[tauri::command]
-fn list_dir(path: Option<String>, app: tauri::AppHandle) -> Result<Listing, String> {
-    let dir: PathBuf = match path {
-        Some(p) => PathBuf::from(p),
-        None => app
-            .path()
-            .home_dir()
-            .map_err(|e| format!("failed to resolve home dir: {e}"))?,
+fn list_dir(path: Option<String>, vfs: tauri::State<'_, VfsState>) -> Result<Listing, String> {
+    let dir = match path {
+        Some(p) => vfs_resolve(&vfs.root, &p)?,
+        None => vfs.root.clone(),
     };
 
-    let read = std::fs::read_dir(&dir).map_err(|e| format!("{}: {}", dir.display(), e))?;
-
-    let mut entries: Vec<DirEntry> = read
-        .filter_map(|r| r.ok())
-        .filter_map(|e| {
-            let meta = e.metadata().ok()?;
-            let name = e.file_name().to_string_lossy().into_owned();
-            let path = e.path().to_string_lossy().into_owned();
+    let mut entries: Vec<DirEntry> = dir
+        .read_dir()
+        .map_err(|e| format!("{}: {e}", dir.as_str()))?
+        .filter_map(|child| {
+            let meta = child.metadata().ok()?;
             Some(DirEntry {
-                name,
-                path,
-                is_dir: meta.is_dir(),
+                name: child.filename(),
+                path: child.as_str().to_string(),
+                is_dir: meta.file_type == vfs::VfsFileType::Directory,
             })
         })
         .collect();
@@ -83,10 +90,12 @@ fn list_dir(path: Option<String>, app: tauri::AppHandle) -> Result<Listing, Stri
     });
 
     Ok(Listing {
-        path: dir.to_string_lossy().into_owned(),
-        parent: dir
-            .parent()
-            .map(|p| p.to_string_lossy().into_owned()),
+        path: dir.as_str().to_string(),
+        parent: if dir.as_str().is_empty() {
+            None
+        } else {
+            Some(dir.parent().as_str().to_string())
+        },
         entries,
     })
 }
@@ -134,6 +143,12 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .invoke_handler(tauri::generate_handler![list_dir, read_file, stream_file])
         .setup(|app| {
+            let home = app.path().home_dir()?;
+            let lower = vfs::VfsPath::new(vfs::PhysicalFS::new(&home));
+            let upper = vfs::VfsPath::new(vfs::MemoryFS::new());
+            let overlay = vfs::OverlayFS::new(&[lower, upper]);
+            app.manage(VfsState { root: vfs::VfsPath::new(overlay) });
+
             let window = app.get_webview_window("main").unwrap();
             #[cfg(target_os = "macos")]
             set_macos_background(&window);
