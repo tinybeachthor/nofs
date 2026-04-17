@@ -44,6 +44,15 @@ type PreviewState = {
   error: string | null;
 };
 
+function HomeIcon() {
+  return (
+    <svg width="14" height="14" viewBox="0 0 14 14" fill="none" xmlns="http://www.w3.org/2000/svg" style={{ display: "block" }}>
+      <path d="M1 6.5L7 1.5L13 6.5" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round" />
+      <path d="M2.5 5.5V12H5.5V9H8.5V12H11.5V5.5" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round" />
+    </svg>
+  );
+}
+
 function FolderIcon() {
   return (
     <svg width="80" height="80" viewBox="0 0 80 80" fill="none" xmlns="http://www.w3.org/2000/svg">
@@ -262,10 +271,10 @@ function App() {
                   <span key={crumb.path} className="fb-crumb-item">
                     {i > 0 && <span className="fb-crumb-sep">/</span>}
                     {i === arr.length - 1 ? (
-                      <span className="fb-crumb fb-crumb-current">{crumb.label}</span>
+                      <span className="fb-crumb fb-crumb-current">{crumb.label === "/" ? <HomeIcon /> : crumb.label}</span>
                     ) : (
                       <button className="fb-crumb" onClick={() => loadDir(crumb.path)}>
-                        {crumb.label}
+                        {crumb.label === "/" ? <HomeIcon /> : crumb.label}
                       </button>
                     )}
                   </span>

@@ -30,7 +30,10 @@ body {
   display: flex;
   align-items: center;
   gap: 8px;
-  padding: 8px 12px;
+  padding: 0 12px;
+  height: 37px;
+  box-sizing: border-box;
+  flex-shrink: 0;
   border-bottom: 1px solid rgba(255, 255, 255, 0.08);
   background-color: #2c2c2e;
   position: sticky;
@@ -65,6 +68,8 @@ body {
 }
 
 .fb-crumb {
+  display: inline-flex;
+  align-items: center;
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
   font-size: 0.9em;
   color: #4a9eff;
@@ -81,12 +86,14 @@ body {
 }
 
 .fb-crumb-current {
+  display: inline-flex;
+  align-items: center;
   color: #aeaeb2;
   cursor: default;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  display: block;
+  padding: 2px 4px;
 }
 
 .fb-error {
