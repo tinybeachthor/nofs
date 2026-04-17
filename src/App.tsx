@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import "./App.css";
 
@@ -98,9 +98,9 @@ function FileIcon() {
   );
 }
 
-function PreviewPanel({ state, onClose }: { state: PreviewState; onClose: () => void }) {
+function PreviewPanel({ state, onClose, width }: { state: PreviewState; onClose: () => void; width: number }) {
   return (
-    <aside className="fb-preview">
+    <aside className="fb-preview" style={{ width }}>
       <header className="fb-preview-header">
         <span className="fb-preview-title">{state.entry.name}</span>
         <button className="fb-preview-close" onClick={onClose} aria-label="Close preview">✕</button>
@@ -133,6 +133,31 @@ function App() {
   const [listing, setListing] = useState<Listing | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [preview, setPreview] = useState<PreviewState | null>(null);
+  const [previewWidth, setPreviewWidth] = useState(320);
+  const resizeRef = useRef<{ startX: number; startWidth: number } | null>(null);
+
+  function onResizeStart(e: React.MouseEvent) {
+    resizeRef.current = { startX: e.clientX, startWidth: previewWidth };
+    document.body.style.cursor = "col-resize";
+    document.body.style.userSelect = "none";
+
+    function onMouseMove(ev: MouseEvent) {
+      if (!resizeRef.current) return;
+      const delta = resizeRef.current.startX - ev.clientX;
+      setPreviewWidth(Math.max(200, Math.min(800, resizeRef.current.startWidth + delta)));
+    }
+
+    function onMouseUp() {
+      resizeRef.current = null;
+      document.body.style.cursor = "";
+      document.body.style.userSelect = "";
+      document.removeEventListener("mousemove", onMouseMove);
+      document.removeEventListener("mouseup", onMouseUp);
+    }
+
+    document.addEventListener("mousemove", onMouseMove);
+    document.addEventListener("mouseup", onMouseUp);
+  }
 
   async function loadDir(path: string | null) {
     try {
@@ -233,7 +258,10 @@ function App() {
           </div>
         )}
         {preview && (
-          <PreviewPanel state={preview} onClose={closePreview} />
+          <>
+            <div className="fb-resize-handle" onMouseDown={onResizeStart} />
+            <PreviewPanel state={preview} onClose={closePreview} width={previewWidth} />
+          </>
         )}
       </div>
     </main>
