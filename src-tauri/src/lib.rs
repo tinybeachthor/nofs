@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 
 use serde::Serialize;
+use tauri::ipc::Response;
 use tauri::Manager;
 
 #[derive(Serialize)]
@@ -25,6 +26,12 @@ enum FilePreview {
 }
 
 const PREVIEW_LIMIT: u64 = 64 * 1024;
+
+#[tauri::command]
+fn stream_file(path: String) -> Result<Response, String> {
+    let bytes = std::fs::read(&path).map_err(|e| format!("{path}: {e}"))?;
+    Ok(Response::new(bytes))
+}
 
 #[tauri::command]
 fn read_file(path: String) -> Result<FilePreview, String> {
@@ -125,7 +132,7 @@ fn set_macos_background(window: &tauri::WebviewWindow) {
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
-        .invoke_handler(tauri::generate_handler![list_dir, read_file])
+        .invoke_handler(tauri::generate_handler![list_dir, read_file, stream_file])
         .setup(|app| {
             let window = app.get_webview_window("main").unwrap();
             #[cfg(target_os = "macos")]

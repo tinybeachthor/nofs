@@ -16,7 +16,27 @@ type Listing = {
 
 type FilePreview =
   | { kind: "Text"; content: string; truncated: boolean }
-  | { kind: "Binary" };
+  | { kind: "Binary" }
+  | { kind: "Image"; url: string }
+  | { kind: "Pdf"; url: string };
+
+const MIME_BY_EXT: Record<string, string> = {
+  png: "image/png", jpg: "image/jpeg", jpeg: "image/jpeg", gif: "image/gif",
+  svg: "image/svg+xml", webp: "image/webp", bmp: "image/bmp", ico: "image/x-icon",
+  avif: "image/avif", tiff: "image/tiff", tif: "image/tiff", pdf: "application/pdf",
+};
+
+function mediaMime(name: string): string | null {
+  const dot = name.lastIndexOf(".");
+  if (dot === -1) return null;
+  return MIME_BY_EXT[name.slice(dot + 1).toLowerCase()] ?? null;
+}
+
+async function streamFileToUrl(path: string, mime: string): Promise<string> {
+  const bytes = await invoke<ArrayBuffer>("stream_file", { path });
+  const blob = new Blob([bytes], { type: mime });
+  return URL.createObjectURL(blob);
+}
 
 type PreviewState = {
   entry: DirEntry;
@@ -90,6 +110,10 @@ function PreviewPanel({ state, onClose }: { state: PreviewState; onClose: () => 
           <p className="fb-preview-error">{state.error}</p>
         ) : state.preview === null ? (
           <p className="fb-preview-meta">Loading…</p>
+        ) : state.preview.kind === "Image" ? (
+          <img src={state.preview.url} alt={state.entry.name} className="fb-preview-image" />
+        ) : state.preview.kind === "Pdf" ? (
+          <iframe src={state.preview.url} className="fb-preview-pdf" title={state.entry.name} />
         ) : state.preview.kind === "Binary" ? (
           <p className="fb-preview-meta">Binary file — no preview available.</p>
         ) : (
@@ -121,16 +145,31 @@ function App() {
   }
 
   async function openPreview(entry: DirEntry) {
+    if (preview?.preview && ("url" in preview.preview)) {
+      URL.revokeObjectURL(preview.preview.url);
+    }
     setPreview({ entry, preview: null, error: null });
     try {
-      const result = await invoke<FilePreview>("read_file", { path: entry.path });
-      setPreview({ entry, preview: result, error: null });
+      const mime = mediaMime(entry.name);
+      if (mime && mime.startsWith("image/")) {
+        const url = await streamFileToUrl(entry.path, mime);
+        setPreview({ entry, preview: { kind: "Image", url }, error: null });
+      } else if (mime === "application/pdf") {
+        const url = await streamFileToUrl(entry.path, mime);
+        setPreview({ entry, preview: { kind: "Pdf", url }, error: null });
+      } else {
+        const result = await invoke<FilePreview>("read_file", { path: entry.path });
+        setPreview({ entry, preview: result, error: null });
+      }
     } catch (e) {
       setPreview({ entry, preview: null, error: String(e) });
     }
   }
 
   function closePreview() {
+    if (preview?.preview && ("url" in preview.preview)) {
+      URL.revokeObjectURL(preview.preview.url);
+    }
     setPreview(null);
   }
 
