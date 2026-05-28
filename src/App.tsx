@@ -139,7 +139,7 @@ function PdfIcon() {
       </defs>
       <path d="M8 4 L44 4 L56 16 L56 76 Q56 78 54 78 L10 78 Q8 78 8 76 Z" fill="url(#pdfBg)" />
       <path d="M44 4 L44 16 L56 16 Z" fill="#d47a76" />
-      <text x="32" y="58" textAnchor="middle" fontFamily="-apple-system, BlinkMacSystemFont, sans-serif" fontWeight="700" fontSize="16" fill="#c0392b" letterSpacing="0.5">PDF</text>
+      <text x="32" y="58" textAnchor="middle" fontFamily="sans-serif" fontWeight="700" fontSize="16" fill="#c0392b" letterSpacing="0.5">PDF</text>
       <rect x="14" y="34" width="36" height="2.5" rx="1.25" fill="#d47a76" opacity="0.6" />
       <rect x="14" y="40" width="28" height="2.5" rx="1.25" fill="#d47a76" opacity="0.6" />
     </svg>

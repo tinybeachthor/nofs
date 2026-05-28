@@ -12,10 +12,9 @@
   "app": {
     "windows": [
       {
-        "title": "",
+        "title": "nofs",
         "width": 800,
-        "height": 600,
-        "titleBarStyle": "Transparent"
+        "height": 600
       }
     ],
     "security": {

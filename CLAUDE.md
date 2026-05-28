@@ -37,7 +37,7 @@ Two-process Tauri 2 desktop app (React 19 + TS frontend, Rust backend).
 - SVG icons: `FolderIcon` (blue gradient folder) and `FileIcon` (grey document) defined inline in `App.tsx`.
 - Topbar shows a clickable breadcrumb trail — each path segment navigates directly to that directory; the current segment is non-interactive.
 - Clicking a file tile opens a slide-in preview panel (`PreviewPanel` in `App.tsx`) on the right showing text content (up to 64 KB) or a "binary file" message. The panel uses a `read_file` Tauri command. The grid and panel sit side-by-side inside `.fb-content`.
-- Window uses `titleBarStyle: "Transparent"` with traffic lights; native window/WKWebView background colors set via macOS `objc` APIs in `lib.rs::set_macos_background()` to prevent white flash on resize.
+- Window uses the platform's standard title bar; no platform-specific native window customization, keeping the app cross-platform.
 
 ## When adding a new Rust command
 
