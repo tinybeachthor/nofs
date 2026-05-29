@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { getCurrentWebview } from "@tauri-apps/api/webview";
 import "./App.css";
 
 type DirEntry = {
@@ -182,7 +183,10 @@ function App() {
   const [error, setError] = useState<string | null>(null);
   const [preview, setPreview] = useState<PreviewState | null>(null);
   const [previewWidth, setPreviewWidth] = useState(320);
+  const [dirty, setDirty] = useState(false);
+  const [dragging, setDragging] = useState(false);
   const resizeRef = useRef<{ startX: number; startWidth: number } | null>(null);
+  const pathRef = useRef<string | null>(null);
 
   function onResizeStart(e: React.MouseEvent) {
     resizeRef.current = { startX: e.clientX, startWidth: previewWidth };
@@ -211,7 +215,18 @@ function App() {
     try {
       const result = await invoke<Listing>("list_dir", { path });
       setListing(result);
+      pathRef.current = result.path;
       setError(null);
+    } catch (e) {
+      setError(String(e));
+    }
+  }
+
+  async function onPersist() {
+    try {
+      const d = await invoke<boolean>("persist");
+      setDirty(d);
+      await loadDir(pathRef.current);
     } catch (e) {
       setError(String(e));
     }
@@ -250,8 +265,34 @@ function App() {
     loadDir(null);
   }, []);
 
+  useEffect(() => {
+    const unlisten = getCurrentWebview().onDragDropEvent(async (event) => {
+      const p = event.payload;
+      if (p.type === "over" || p.type === "enter") {
+        setDragging(true);
+      } else if (p.type === "leave") {
+        setDragging(false);
+      } else if (p.type === "drop") {
+        setDragging(false);
+        try {
+          const d = await invoke<boolean>("add_dropped_files", {
+            destDir: pathRef.current ?? "/",
+            paths: p.paths,
+          });
+          setDirty(d);
+          await loadDir(pathRef.current);
+        } catch (e) {
+          setError(String(e));
+        }
+      }
+    });
+    return () => {
+      unlisten.then((fn) => fn());
+    };
+  }, []);
+
   return (
-    <main className="fb">
+    <main className={`fb${dragging ? " fb-dragging" : ""}`}>
       <header className="fb-topbar">
         <nav className="fb-breadcrumbs">
           {listing
@@ -281,6 +322,9 @@ function App() {
                 ))
             : null}
         </nav>
+        {dirty && (
+          <button className="fb-persist" onClick={onPersist}>Persist</button>
+        )}
       </header>
 
       {error && <div className="fb-error">{error}</div>}

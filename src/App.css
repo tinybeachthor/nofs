@@ -40,6 +40,31 @@ body {
   top: 0;
 }
 
+.fb-persist {
+  flex-shrink: 0;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.85em;
+  color: #ffffff;
+  background-color: #4a9eff;
+  border: none;
+  padding: 4px 12px;
+  border-radius: 5px;
+  cursor: pointer;
+}
+
+.fb-persist:hover {
+  background-color: #3a8eef;
+}
+
+.fb-persist:active {
+  background-color: #2a7edf;
+}
+
+.fb-dragging {
+  outline: 2px dashed #4a9eff;
+  outline-offset: -4px;
+}
+
 .fb-breadcrumbs {
   display: flex;
   align-items: center;
