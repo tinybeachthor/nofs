@@ -172,10 +172,26 @@ body {
 }
 
 .fb-tile-icon {
+  position: relative;
   display: flex;
   align-items: center;
   justify-content: center;
   filter: drop-shadow(0 4px 8px rgba(0, 0, 0, 0.5));
+}
+
+.fb-tile-badge {
+  position: absolute;
+  top: -2px;
+  right: 8px;
+  font-size: 12px;
+  line-height: 1;
+  color: #4a9eff;
+  filter: drop-shadow(0 0 3px rgba(74, 158, 255, 0.7));
+  pointer-events: none;
+}
+
+.fb-tile-managed .fb-tile-name {
+  color: #8fc2ff;
 }
 
 .fb-tile-dir:hover .fb-tile-icon {

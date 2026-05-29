@@ -9,6 +9,9 @@ struct DirEntry {
     name: String,
     path: String,
     is_dir: bool,
+    // true when this path exists in the live memory or a persisted snapshot
+    // layer (i.e. it is "ours"); false when it comes only from the home FS.
+    managed: bool,
 }
 
 #[derive(Serialize)]
@@ -52,6 +55,19 @@ fn build_overlay(
 
 fn is_dirty(mem: &vfs::VfsPath) -> bool {
     mem.read_dir().map(|mut it| it.next().is_some()).unwrap_or(false)
+}
+
+/// Whether `path` is served by the live memory layer or any persisted snapshot
+/// (as opposed to coming only from the read-only home filesystem).
+fn is_managed(memory: &vfs::VfsPath, persisted: &[vfs::VfsPath], path: &str) -> bool {
+    let rel = path.trim_start_matches('/');
+    if rel.is_empty() {
+        return false;
+    }
+    let exists = |layer: &vfs::VfsPath| {
+        layer.join(rel).map(|p| p.exists().unwrap_or(false)).unwrap_or(false)
+    };
+    exists(memory) || persisted.iter().any(exists)
 }
 
 fn vfs_resolve(root: &vfs::VfsPath, path: &str) -> Result<vfs::VfsPath, String> {
@@ -184,7 +200,10 @@ fn read_file(path: String, vfs: tauri::State<'_, VfsState>) -> Result<FilePrevie
 
 #[tauri::command]
 fn list_dir(path: Option<String>, vfs: tauri::State<'_, VfsState>) -> Result<Listing, String> {
-    let root = vfs.inner.lock().unwrap().root.clone();
+    let (root, memory, persisted) = {
+        let inner = vfs.inner.lock().unwrap();
+        (inner.root.clone(), inner.memory.clone(), inner.persisted.clone())
+    };
     let dir = match path {
         Some(p) => vfs_resolve(&root, &p)?,
         None => root.clone(),
@@ -196,9 +215,11 @@ fn list_dir(path: Option<String>, vfs: tauri::State<'_, VfsState>) -> Result<Lis
         .map_err(|e| format!("{}: {e}", dir.as_str()))?
         .filter_map(|child| {
             let meta = child.metadata().ok()?;
+            let path = child.as_str().to_string();
             Some(DirEntry {
                 name: child.filename(),
-                path: child.as_str().to_string(),
+                managed: is_managed(&memory, &persisted, &path),
+                path,
                 is_dir: meta.file_type == vfs::VfsFileType::Directory,
             })
         })

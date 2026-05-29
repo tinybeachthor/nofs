@@ -7,6 +7,7 @@ type DirEntry = {
   name: string;
   path: string;
   is_dir: boolean;
+  managed: boolean;
 };
 
 type Listing = {
@@ -335,13 +336,14 @@ function App() {
             {listing.entries.map((e) => (
               <div
                 key={e.path}
-                className={`fb-tile ${e.is_dir ? "fb-tile-dir" : "fb-tile-file"}${preview?.entry.path === e.path ? " fb-tile-selected" : ""}`}
+                className={`fb-tile ${e.is_dir ? "fb-tile-dir" : "fb-tile-file"}${e.managed ? " fb-tile-managed" : ""}${preview?.entry.path === e.path ? " fb-tile-selected" : ""}`}
                 onClick={() => {
                   if (e.is_dir) { closePreview(); loadDir(e.path); }
                   else { openPreview(e); }
                 }}
               >
                 <div className="fb-tile-icon">
+                  {e.managed && <span className="fb-tile-badge" title="Stored in your overlay layers">●</span>}
                   {e.is_dir ? <FolderIcon /> : (() => {
                     const mime = mediaMime(e.name);
                     if (mime?.startsWith("image/")) return <ImageIcon />;
