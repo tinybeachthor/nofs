@@ -304,3 +304,99 @@ pub fn run() {
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Read, Write};
+
+    fn mem() -> vfs::VfsPath {
+        vfs::VfsPath::new(vfs::MemoryFS::new())
+    }
+
+    fn write(root: &vfs::VfsPath, path: &str, content: &str) {
+        let dest = root.join(path).unwrap();
+        dest.parent().create_dir_all().unwrap();
+        dest.create_file().unwrap().write_all(content.as_bytes()).unwrap();
+    }
+
+    fn read(root: &vfs::VfsPath, path: &str) -> String {
+        let mut s = String::new();
+        root.join(path).unwrap().open_file().unwrap().read_to_string(&mut s).unwrap();
+        s
+    }
+
+    #[test]
+    fn archive_roundtrip_preserves_nested_files() {
+        let m = mem();
+        write(&m, "a.txt", "alpha");
+        write(&m, "sub/b.txt", "bravo");
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("00001.tar.gz");
+
+        archive_memory(&m, &out).unwrap();
+        let loaded = load_archive(&out).unwrap();
+
+        assert_eq!(read(&loaded, "a.txt"), "alpha");
+        assert_eq!(read(&loaded, "sub/b.txt"), "bravo");
+    }
+
+    #[test]
+    fn is_dirty_reflects_contents() {
+        let m = mem();
+        assert!(!is_dirty(&m));
+        write(&m, "x.txt", "1");
+        assert!(is_dirty(&m));
+    }
+
+    #[test]
+    fn next_layer_number_skips_existing_and_ignores_non_archives() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("00001.tar.gz"), b"").unwrap();
+        std::fs::write(dir.path().join("00003.tar.gz"), b"").unwrap();
+        std::fs::write(dir.path().join("notes.txt"), b"").unwrap();
+        assert_eq!(next_layer_number(dir.path()), 4);
+    }
+
+    #[test]
+    fn next_layer_number_empty_dir_is_one() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(next_layer_number(dir.path()), 1);
+    }
+
+    #[test]
+    fn overlay_resolves_layers_in_order() {
+        let home = mem();
+        write(&home, "shared.txt", "home");
+        write(&home, "only_home.txt", "home");
+        let persisted = mem();
+        write(&persisted, "shared.txt", "persist");
+        let live = mem();
+
+        // empty live layer: persisted shadows home, home still visible elsewhere
+        let overlay = build_overlay(&live, std::slice::from_ref(&persisted), &home);
+        assert_eq!(read(&overlay, "shared.txt"), "persist");
+        assert_eq!(read(&overlay, "only_home.txt"), "home");
+
+        // live layer shadows everything below
+        write(&live, "shared.txt", "memory");
+        let overlay = build_overlay(&live, std::slice::from_ref(&persisted), &home);
+        assert_eq!(read(&overlay, "shared.txt"), "memory");
+    }
+
+    #[test]
+    fn load_all_archives_orders_newest_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = mem();
+        write(&first, "f.txt", "first");
+        archive_memory(&first, &dir.path().join("00001.tar.gz")).unwrap();
+        let second = mem();
+        write(&second, "f.txt", "second");
+        archive_memory(&second, &dir.path().join("00002.tar.gz")).unwrap();
+
+        let layers = load_all_archives(dir.path());
+        assert_eq!(layers.len(), 2);
+        assert_eq!(read(&layers[0], "f.txt"), "second");
+        assert_eq!(read(&layers[1], "f.txt"), "first");
+    }
+}
