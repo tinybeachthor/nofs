@@ -22,6 +22,18 @@ type FilePreview =
   | { kind: "Image"; url: string }
   | { kind: "Pdf"; url: string };
 
+type SnapshotInfo = {
+  number: number;
+  created_ms: number;
+};
+
+function formatSnapshotDate(ms: number): string {
+  if (!ms) return "unknown date";
+  return new Date(ms).toLocaleString(undefined, {
+    year: "numeric", month: "short", day: "numeric", hour: "2-digit", minute: "2-digit",
+  });
+}
+
 const MIME_BY_EXT: Record<string, string> = {
   png: "image/png", jpg: "image/jpeg", jpeg: "image/jpeg", gif: "image/gif",
   svg: "image/svg+xml", webp: "image/webp", bmp: "image/bmp", ico: "image/x-icon",
@@ -34,8 +46,8 @@ function mediaMime(name: string): string | null {
   return MIME_BY_EXT[name.slice(dot + 1).toLowerCase()] ?? null;
 }
 
-async function streamFileToUrl(path: string, mime: string): Promise<string> {
-  const bytes = await invoke<ArrayBuffer>("stream_file", { path });
+async function streamFileToUrl(path: string, mime: string, snapshot: number | null): Promise<string> {
+  const bytes = await invoke<ArrayBuffer>("stream_file", { path, snapshot });
   const blob = new Blob([bytes], { type: mime });
   return URL.createObjectURL(blob);
 }
@@ -186,8 +198,13 @@ function App() {
   const [previewWidth, setPreviewWidth] = useState(320);
   const [dirty, setDirty] = useState(false);
   const [dragging, setDragging] = useState(false);
+  const [snapshots, setSnapshots] = useState<SnapshotInfo[]>([]);
+  const [snapshot, setSnapshot] = useState<number | null>(null);
   const resizeRef = useRef<{ startX: number; startWidth: number } | null>(null);
   const pathRef = useRef<string | null>(null);
+  // Mirrors `snapshot` for the drag-drop effect, whose listener is registered
+  // once (empty deps) and would otherwise close over a stale value.
+  const snapshotRef = useRef<number | null>(null);
 
   function onResizeStart(e: React.MouseEvent) {
     resizeRef.current = { startX: e.clientX, startWidth: previewWidth };
@@ -214,10 +231,18 @@ function App() {
 
   async function loadDir(path: string | null) {
     try {
-      const result = await invoke<Listing>("list_dir", { path });
+      const result = await invoke<Listing>("list_dir", { path, snapshot: snapshotRef.current });
       setListing(result);
       pathRef.current = result.path;
       setError(null);
+    } catch (e) {
+      setError(String(e));
+    }
+  }
+
+  async function loadSnapshots() {
+    try {
+      setSnapshots(await invoke<SnapshotInfo[]>("list_snapshots"));
     } catch (e) {
       setError(String(e));
     }
@@ -227,9 +252,26 @@ function App() {
     try {
       const d = await invoke<boolean>("persist");
       setDirty(d);
+      await loadSnapshots();
       await loadDir(pathRef.current);
     } catch (e) {
       setError(String(e));
+    }
+  }
+
+  // Switch between the live view (null) and a read-only snapshot view (number).
+  async function switchView(n: number | null) {
+    closePreview();
+    snapshotRef.current = n;
+    setSnapshot(n);
+    try {
+      const result = await invoke<Listing>("list_dir", { path: pathRef.current, snapshot: n });
+      setListing(result);
+      pathRef.current = result.path;
+      setError(null);
+    } catch {
+      // Current dir may not exist in this view — fall back to root.
+      await loadDir(null);
     }
   }
 
@@ -239,15 +281,16 @@ function App() {
     }
     setPreview({ entry, preview: null, error: null });
     try {
+      const snap = snapshotRef.current;
       const mime = mediaMime(entry.name);
       if (mime && mime.startsWith("image/")) {
-        const url = await streamFileToUrl(entry.path, mime);
+        const url = await streamFileToUrl(entry.path, mime, snap);
         setPreview({ entry, preview: { kind: "Image", url }, error: null });
       } else if (mime === "application/pdf") {
-        const url = await streamFileToUrl(entry.path, mime);
+        const url = await streamFileToUrl(entry.path, mime, snap);
         setPreview({ entry, preview: { kind: "Pdf", url }, error: null });
       } else {
-        const result = await invoke<FilePreview>("read_file", { path: entry.path });
+        const result = await invoke<FilePreview>("read_file", { path: entry.path, snapshot: snap });
         setPreview({ entry, preview: result, error: null });
       }
     } catch (e) {
@@ -264,11 +307,17 @@ function App() {
 
   useEffect(() => {
     loadDir(null);
+    loadSnapshots();
   }, []);
 
   useEffect(() => {
     const unlisten = getCurrentWebview().onDragDropEvent(async (event) => {
       const p = event.payload;
+      // Snapshot views are read-only: ignore drops and the drag highlight.
+      if (snapshotRef.current !== null) {
+        setDragging(false);
+        return;
+      }
       if (p.type === "over" || p.type === "enter") {
         setDragging(true);
       } else if (p.type === "leave") {
@@ -323,10 +372,34 @@ function App() {
                 ))
             : null}
         </nav>
-        {dirty && (
+        {snapshots.length > 0 && (
+          <select
+            className="fb-history"
+            value={snapshot ?? ""}
+            onChange={(e) => switchView(e.target.value === "" ? null : Number(e.target.value))}
+          >
+            <option value="">Now</option>
+            {snapshots.map((s) => (
+              <option key={s.number} value={s.number}>
+                #{s.number} — {formatSnapshotDate(s.created_ms)}
+              </option>
+            ))}
+          </select>
+        )}
+        {dirty && snapshot === null && (
           <button className="fb-persist" onClick={onPersist}>Persist</button>
         )}
       </header>
+
+      {snapshot !== null && (
+        <div className="fb-snapshot-banner">
+          <span>
+            Viewing snapshot #{snapshot} —{" "}
+            {formatSnapshotDate(snapshots.find((s) => s.number === snapshot)?.created_ms ?? 0)} · read-only
+          </span>
+          <button className="fb-snapshot-exit" onClick={() => switchView(null)}>Exit</button>
+        </div>
+      )}
 
       {error && <div className="fb-error">{error}</div>}
 
